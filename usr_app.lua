@@ -136,21 +136,30 @@ function app.start()
                                         mcu_cmd = mcu_cmd .. "\r\n"
                                         uart.send(mcu_cmd)
                                         log.info("UART_TX", "Forwarded to MCU: " .. mcu_cmd)
+
+                                        -- Reply immediately to server so long MCU actions (e.g. methane measure)
+                                        -- don't cause server-side timeout/retry.
+                                        local cmd_no_crlf = string.gsub(mcu_cmd, "\r\n", "")
+                                        local fast_ack = "ACK:" .. imei .. "," .. cmd_no_crlf .. ",1"
+                                        socket.tx(netc, fast_ack)
+                                        log.info("UDP_TX", "Immediate ACK: " .. fast_ack)
                                         
-                                        -- Give MCU time to reply, we'll catch it in the background UART task
-                                        -- and we need a way to forward the async reply back to UDP.
-                                        -- We will wait up to 3 seconds for the MCU's immediate reply
-                                        local r, ack_line = sys.waitUntil("UART_RECV", 3000)
-                                        if r and ack_line then
-                                            -- Forward back to server, injecting ID
-                                            -- e.g., MCU replies CONFIG:ALARM_TEMP,50 -> CONFIG:IMEI,ALARM_TEMP,50
-                                            local colon_pos = string.find(ack_line, ":")
-                                            if colon_pos then
-                                                local prefix = string.sub(ack_line, 1, colon_pos)
-                                                local suffix = string.sub(ack_line, colon_pos + 1)
-                                                local fwd_msg = prefix .. imei .. "," .. suffix
-                                                socket.tx(netc, fwd_msg)
-                                                log.info("UDP_TX", "Forwarded MCU Reply: " .. fwd_msg)
+                                        -- START: commands may take >20s on MCU side. Don't block here.
+                                        -- Final MCU data will be forwarded asynchronously when received.
+                                        if string.find(cmd, "START:") ~= 1 then
+                                            -- For non-START commands, still try to forward immediate MCU reply.
+                                            local r, ack_line = sys.waitUntil("UART_RECV", 3000)
+                                            if r and ack_line then
+                                                -- Forward back to server, injecting ID
+                                                -- e.g., MCU replies CONFIG:ALARM_TEMP,50 -> CONFIG:IMEI,ALARM_TEMP,50
+                                                local colon_pos = string.find(ack_line, ":")
+                                                if colon_pos then
+                                                    local prefix = string.sub(ack_line, 1, colon_pos)
+                                                    local suffix = string.sub(ack_line, colon_pos + 1)
+                                                    local fwd_msg = prefix .. imei .. "," .. suffix
+                                                    socket.tx(netc, fwd_msg)
+                                                    log.info("UDP_TX", "Forwarded MCU Reply: " .. fwd_msg)
+                                                end
                                             end
                                         end
                                     end
