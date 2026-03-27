@@ -14,13 +14,13 @@ end
 -- Turn LED On
 function led.on()
     gpio.set(config.LED_PIN, 0) -- Active Low
-    log.info("LED", "Set GPIO " .. config.LED_PIN .. " to 0 (ON)")
+    -- log.info("LED", "Set GPIO " .. config.LED_PIN .. " to 0 (ON)")
 end
 
 -- Turn LED Off
 function led.off()
     gpio.set(config.LED_PIN, 1) -- Active Low
-    log.info("LED", "Set GPIO " .. config.LED_PIN .. " to 1 (OFF)")
+    -- log.info("LED", "Set GPIO " .. config.LED_PIN .. " to 1 (OFF)")
 end
 
 -- Blink LED once (BLOCKING usually, but here we just toggle)

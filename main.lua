@@ -11,17 +11,16 @@ local config = require("usr_config")
 -- pm is global
 local app = require("usr_app")
 
--- Initialize Power Management (PSM)
--- Wait for system to stabilize (prevent immediate sleep/crash loop)
+-- 初始化功耗管理
+-- 启动延时，防止模块在极端情况下启动即休眠导致无法维护
 sys.taskInit(function()
     sys.wait(3000) 
     log.info("MAIN", "System Started")
     
-    -- Initialize Power Management (PSM) AFTER startup
-    -- Moved to usr_app.lua to ensure network is ready first
-    -- pm.power(pm.WORK_MODE, config.POWER_MODE)
+    -- 设置模块为 Light Sleep 模式已移至 usr_app.lua
+    -- 确保网络建立并进入持久连接后再开启休眠
     
-    -- Enable PWRKEY Wakeup from PSM (Important!)
+    -- 启用 PWRKEY 唤醒（保留作为备选唤醒手段）
     if pm.PWK_MODE then
         pm.power(pm.PWK_MODE, true)
     end

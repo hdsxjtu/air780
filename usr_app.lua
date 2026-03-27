@@ -7,9 +7,10 @@ local uart = require("usr_uart")
 local app = {}
 local netc = nil
 local next_msg_id = 9000
-local pending_report_id = nil
 local last_mcu_alive = true
+local imei = ""
 
+-- 建立短码与长参数名的映射表（用于协议解析）
 local LONG_TO_SHORT = {
     REPORT_INTERVAL = "RPT_INT",
     ALARM_BARO_A_LOW = "PRA_L",
@@ -28,12 +29,14 @@ for long_name, short_name in pairs(LONG_TO_SHORT) do
     SHORT_TO_LONG[short_name] = long_name
 end
 
+-- 全量参数排序（用于返回 CFG_ALL）
 local PARAM_ORDER = {
     "RPT_INT", "PRA_L", "PRA_H", "PRB_L", "PRB_H",
     "CH4_L", "CH4_H", "TMP_L", "TMP_H", "BAT_L",
 }
 
--- Utility to get string parts separated by comma
+-- Utility functions
+-- 辅助函数：按分隔符拆分字符串
 local function split(str, reps)
     local resultStrList = {}
     string.gsub(str, '[^' .. reps .. ']+', function(w)
@@ -42,6 +45,7 @@ local function split(str, reps)
     return resultStrList
 end
 
+-- 辅助函数：按分隔符拆分字符串为固定数量的片段
 local function split_n(str, sep, max_parts)
     local parts = {}
     local start_pos = 1
@@ -60,6 +64,7 @@ local function split_n(str, sep, max_parts)
     return parts
 end
 
+-- 生成下一个消息 ID (9000-9999 循环)
 local function next_id()
     next_msg_id = next_msg_id + 1
     if next_msg_id > 9999 then
@@ -68,6 +73,7 @@ local function next_id()
     return tostring(next_msg_id)
 end
 
+-- 解析 payload 字符串 (did=XXX;gv=YYY) 为表结构
 local function parse_payload(payload)
     local result = {}
     for segment in string.gmatch(payload or "", "[^;]+") do
@@ -81,71 +87,51 @@ local function parse_payload(payload)
     return result
 end
 
+-- 构建协议帧：头,版本,MID,类型,命令,载荷
 local function build_frame(header, mid, frame_type, cmd, payload)
     return table.concat({header, "1", mid, frame_type, cmd, payload or ""}, ",")
 end
 
-local function frame_tx(sock, header, mid, frame_type, cmd, payload)
-    local message = build_frame(header, mid, frame_type, cmd, payload)
-    socket.tx(sock, message)
-    log.info("UDP_TX", message)
-end
-
+-- 向服务器发送 AS 帧
 local function as_tx(sock, mid, frame_type, cmd, payload)
-    frame_tx(sock, "AS", mid, frame_type, cmd, payload)
+    if sock then
+        local message = build_frame("AS", mid, frame_type, cmd, payload)
+        socket.tx(sock, message)
+        log.info("UDP_TX", message)
+    end
 end
 
-local function mr_payload(imei, mcu_line)
-    return "did=" .. imei .. ";gv=4G" .. config.VERSION .. ";" .. mcu_line
+-- 构建测量上报 (MR) 的载荷部分
+local function mr_payload(mcu_line)
+    return "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";" .. mcu_line
 end
 
-local function rsp_payload(imei, suffix)
-    return "did=" .. imei .. ";gv=4G" .. config.VERSION .. ";" .. suffix
-end
-
-local function modem_payload(imei, mcu_alive)
+-- 构建模组状态 (MD) 的载荷部分
+local function modem_payload(mcu_alive)
     local rsrp = -99
     if mobile and mobile.rsrp then
         rsrp = mobile.rsrp()
     end
     local mdead = mcu_alive and "0" or "1"
-    return "did=" .. imei .. ";gv=4G" .. config.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
+    return "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
 end
 
+-- 解析服务器下发的 SA 帧
 local function parse_sa_frame(data)
-    -- New protocol: SA,<ver>,<mid>,<type>,<cmd>,<payload>
     local p6 = split_n(data, ",", 6)
     if #p6 == 6 and p6[1] == "SA" then
-        return {
-            ver = p6[2],
-            id = p6[3],
-            type = p6[4],
-            cmd = p6[5],
-            payload = p6[6],
-        }
+        -- 网络调试助手发送的内容经常附带隐藏的回车换行符，必须将它们剔除
+        local clean_payload = string.gsub(p6[6] or "", "[\r\n]", "")
+        return {ver = p6[2], id = p6[3], type = p6[4], cmd = p6[5], payload = clean_payload}
     end
-
-    -- Compatibility: SA,<ver>,<mid>,<src>,<dst>,<type>,<cmd>,<payload>
-    local p8 = split_n(data, ",", 8)
-    if #p8 == 8 and p8[1] == "SA" then
-        return {
-            ver = p8[2],
-            id = p8[3],
-            type = p8[6],
-            cmd = p8[7],
-            payload = p8[8],
-        }
-    end
-
     return nil
 end
 
+-- 等待串口数据返回特定格式的行（超时退出）
 local function wait_for_uart_line(timeout_ms, matcher)
-    local elapsed = 0
-    while elapsed < timeout_ms do
-        local wait_ms = math.min(500, timeout_ms - elapsed)
-        local ok, line = sys.waitUntil("UART_RECV", wait_ms)
-        elapsed = elapsed + wait_ms
+    local end_time = mcu.ticks() + timeout_ms
+    while mcu.ticks() < end_time do
+        local ok, line = sys.waitUntil("UART_RECV", 500)
         if ok and line and matcher(line) then
             return line
         end
@@ -159,300 +145,265 @@ local function wait_for_ack(timeout_ms)
     end)
 end
 
+-- 从串口收集配置参数：支持旧的 CONFIG: 格式和新的 MA RSP 格式
 local function collect_config_params(timeout_ms)
     local values = {}
-    local elapsed = 0
-
-    while elapsed < timeout_ms do
-        local wait_ms = math.min(500, timeout_ms - elapsed)
-        local ok, line = sys.waitUntil("UART_RECV", wait_ms)
-        elapsed = elapsed + wait_ms
-
+    local end_time = mcu.ticks() + timeout_ms
+    while mcu.ticks() < end_time do
+        local ok, line = sys.waitUntil("UART_RECV", 500)
         if ok and line then
-            if string.sub(line, 1, 7) == "CONFIG:" then
+            if string.sub(line, 1, 2) == "MA" then
+                -- 处理 V1.1 协议帧: MA,1,mid,RSP,CG,payload
+                local p6 = split_n(line, ",", 6)
+                if #p6 == 6 and p6[5] == "CG" then
+                    local payload_map = parse_payload(p6[6])
+                    -- 如果 payload 包含 params=CFG_ALL，则参数就在这一行
+                    for k, v in pairs(payload_map) do
+                        if k ~= "devID" and k ~= "params" and k ~= "gv" then
+                            values[k] = v
+                        end
+                    end
+                    -- 如果是单行全量返回，直接结束
+                    if string.find(p6[6], "params=CFG_ALL") then break end
+                end
+            elseif string.sub(line, 1, 7) == "CONFIG:" then
+                -- 兼容旧的 CONFIG:key,value 格式
                 local body = string.sub(line, 8)
-                if body == "END" then
-                    break
-                end
-
+                if body == "END" then break end
                 local kv = split(body, ",")
-                local long_name = kv[1]
-                local short_name = LONG_TO_SHORT[long_name]
-                if short_name and kv[2] then
-                    values[short_name] = kv[2]
-                end
+                local short_name = LONG_TO_SHORT[kv[1]] or kv[1]
+                if short_name and kv[2] then values[short_name] = kv[2] end
             elseif line == "ACK:0" then
-                -- Ignore ack lines during config collection.
+                -- 忽略通用应答
             elseif string.sub(line, 1, 4) == "ERR:" then
                 return nil
             end
         end
     end
-
     local result = {}
     for _, key in ipairs(PARAM_ORDER) do
-        if values[key] then
-            table.insert(result, key .. "=" .. values[key])
-        end
+        if values[key] then table.insert(result, key .. "=" .. values[key]) end
     end
-
-    if #result == 0 then
-        return nil
-    end
-
-    return table.concat(result, ",")
+    return #result > 0 and table.concat(result, ",") or nil
 end
 
 local function find_set_param(payload_map)
     for key, value in pairs(payload_map) do
-        if key ~= "did" and key ~= "gv" and key ~= "ack" and key ~= "params" then
+        if key ~= "devID" and key ~= "gv" and key ~= "ack" and key ~= "params" then
             return key, value
         end
     end
     return nil, nil
 end
 
-local function send_measure_event(sock, imei, line)
-    local report_id = pending_report_id or next_id()
-    pending_report_id = nil
-    as_tx(sock, report_id, "EVT", "MR", mr_payload(imei, line))
+-- 向 MCU 发送 AM 帧
+local function am_tx(mid, frame_type, cmd, payload)
+    local message = build_frame("AM", mid, frame_type, cmd, payload)
+    uart.send(message .. "\r\n")
+    log.info("UART_TX", message)
 end
 
-local function send_measure_event_with_temp_socket(imei, line)
-    if not (config.SERVER_IP and config.SERVER_PORT) then
-        return
-    end
-
-    local temp_netc = socket.create(nil, "udp_gps")
-    socket.config(temp_netc, nil, true)
-    if socket.connect(temp_netc, config.SERVER_IP, config.SERVER_PORT) then
-        send_measure_event(temp_netc, imei, line)
-        sys.wait(500)
-        socket.close(temp_netc)
-    end
-end
-
-local function handle_legacy_command(sock, imei, data, mcu_alive)
-    local parts = split(data, ",")
-    if #parts < 2 then
-        return false
-    end
-
-    local cmd = parts[1]
-    local target_id = parts[2]
-    if target_id ~= imei then
-        return true
-    end
-
-    if cmd == "GET:GPS" then
-        local res, lat, lng = lbs.getLocation()
-        if res == 0 then
-            socket.tx(sock, "GPS:" .. imei .. "," .. lat .. "," .. lng .. ",0,0,0")
-        end
-        return true
-    end
-
-    if cmd == "GET:MODEM" then
-        local rsrp = -99
-        if mobile and mobile.rsrp then
-            rsrp = mobile.rsrp()
-        end
-        local is_dead = mcu_alive and "0" or "1"
-        socket.tx(sock, "MODEM:" .. imei .. ",Air780E,V" .. config.VERSION .. "," .. rsrp .. ",4G," .. is_dead)
-        return true
-    end
-
-    return false
-end
-
-local function handle_sa_command(sock, imei, frame)
-    if frame.type ~= "CMD" then
-        return
-    end
-
+-- 处理服务器下发的具体命令任务
+local function handle_sa_command(sock, frame)
+    if frame.type ~= "CMD" then return end
     local payload_map = parse_payload(frame.payload)
-    if payload_map.did and payload_map.did ~= imei then
-        return
-    end
+    if payload_map.devID and payload_map.devID ~= imei then return end
 
     if frame.cmd == "CG" then
-        uart.send("GET:CONFIG\r\n")
+        -- 查询参数命令：改为发送 AM 帧
+        local mid_mcu = next_id()
+        am_tx(mid_mcu, "CMD", "CG", "devID=" .. imei)
         local params = collect_config_params(5000)
         if params then
-            as_tx(sock, frame.id, "RSP", "CG", rsp_payload(imei, "params=" .. params))
+            as_tx(sock, frame.id, "RSP", "CG", "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";params=" .. params)
         end
-        return
-    end
-
-    if frame.cmd == "CS" then
-        local param_key, param_value = find_set_param(payload_map)
-        if not param_key or not param_value then
-            return
+    elseif frame.cmd == "CS" then
+        -- 设置参数命令：改为发送 AM 帧
+        local param_key, param_value
+        for k, v in pairs(payload_map) do
+            if k ~= "devID" and k ~= "gv" then param_key, param_value = k, v break end
         end
-
-        local long_name = SHORT_TO_LONG[param_key] or param_key
-        uart.send("SET:CONFIG," .. long_name .. "," .. param_value .. "\r\n")
-        local ack_line = wait_for_ack(3000)
-        local ack_value = ack_line and "0" or "1"
-        as_tx(sock, frame.id, "RSP", "CS", rsp_payload(imei, "ack=" .. ack_value))
-        return
-    end
-
-    if frame.cmd == "MS" or frame.cmd == "MG" then
-        pending_report_id = frame.id
-        as_tx(sock, frame.id, "ACK", frame.cmd, rsp_payload(imei, "ack=1"))
-
-        if frame.cmd == "MS" then
-            uart.send("START:MEASURE\r\n")
-        else
-            uart.send("GET:MCU\r\n")
+        if param_key and param_value then
+            local mid_mcu = next_id()
+            local payload = "devID=" .. imei .. ";" .. param_key .. "=" .. param_value
+            am_tx(mid_mcu, "CMD", "CS", payload)
+            local ack_line = wait_for_uart_line(3000, function(l) return l == "ACK:0" end)
+            as_tx(sock, frame.id, "RSP", "CS", "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=" .. (ack_line and "0" or "1"))
         end
-
-        wait_for_ack(1000)
-        return
-    end
-
-    if frame.cmd == "MD" then
-        as_tx(sock, frame.id, "RSP", "MD", modem_payload(imei, last_mcu_alive))
-        return
+    elseif frame.cmd == "MS" or frame.cmd == "MG" then
+        -- 采样命令：先回 ACK，触发测量后再等 MR 上报
+        as_tx(sock, frame.id, "ACK", frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=1")
+        
+        local mid_mcu = next_id()
+        am_tx(mid_mcu, "CMD", frame.cmd, "devID=" .. imei)
+        -- 将服务器的 MID 发布出去，让串口监听任务能关联上报
+        sys.publish("PENDING_SERVER_MID", frame.id)
+    elseif frame.cmd == "MD" then
+        -- 链路查询命令
+        as_tx(sock, frame.id, "RSP", "MD", modem_payload(last_mcu_alive))
     end
 end
 
+-- Task 1: Persistent Network Connection and Downlink Listener
+-- 任务一：持久网络连接及下行监听任务
+-- 负责建立 UDP 长连接，维持在线状态，处理服务器发来的数据
+local function network_task()
+    while true do
+        if socket.localIP() == "0.0.0.0" or socket.localIP() == nil then
+            sys.waitUntil("IP_READY")
+        end
+        log.info("APP", "Network Ready, connecting to " .. config.SERVER_IP)
+
+        netc = socket.create(nil, "udp_app")
+        socket.config(netc, nil, true)
+
+        if socket.on then
+            -- 真机/新固件：异步回调，有数据时主动通知
+            socket.on(netc, function(id, event)
+                if event == socket.EVENT_RX then
+                    local succ, data = socket.rx(netc)
+                    if succ and type(data) == "string" and #data > 0 then
+                        log.info("UDP_RX", data)
+                        local frame = parse_sa_frame(data)
+                        if frame then handle_sa_command(netc, frame) end
+                    end
+                elseif event == socket.EVENT_CLOSE then
+                    sys.publish("SOCKET_CLOSED")
+                end
+            end)
+        else
+            -- PC 模拟器兼容：启动后台轮询任务拉取下行数据
+            log.warn("APP", "No socket.on, using polling rx (simulator mode)")
+            sys.taskInit(function()
+                while netc do
+                    local succ, data = socket.rx(netc)
+                    if succ and type(data) == "string" and #data > 0 then
+                        log.info("UDP_RX", data)
+                        local frame = parse_sa_frame(data)
+                        if frame then handle_sa_command(netc, frame) end
+                    end
+                    sys.wait(200)
+                end
+            end)
+        end
+
+        if socket.connect(netc, config.SERVER_IP, config.SERVER_PORT) then
+            log.info("APP", "UDP Connected to " .. config.SERVER_IP .. ":" .. config.SERVER_PORT)
+            pm.power(pm.WORK_MODE, config.POWER_MODE)
+            -- 真机靠 socket.on CLOSE 事件触发；模拟器中该事件不会来，设超长超时兜底
+            sys.waitUntil("SOCKET_CLOSED", 86400000)
+            log.warn("APP", "Socket closed, reconnecting...")
+        else
+            log.error("APP", "UDP Connect Failed, retry in 5s")
+            sys.wait(5000)
+        end
+
+        if netc then socket.close(netc) netc = nil end
+    end
+end
+
+-- Task 2: Periodic MCU Data Request (Timer-based)
+-- 任务二：定时上报任务
+-- 根据 RPT_INT 时间定期请求 MCU 数据，监控 MCU 是否在线
+local function timer_task()
+    while true do
+        sys.wait(config.REPORT_INTERVAL)
+        log.info("APP", "Periodic Report Cycle")
+        
+        local mcu_responded = false
+        for retry = 1, 3 do
+            local mid_mcu = next_id()
+            am_tx(mid_mcu, "CMD", "MG", "devID=" .. imei)
+            local ack = wait_for_uart_line(2000, function(l) return l == "ACK:0" end)
+            if ack then
+                mcu_responded = true
+                break
+            end
+            log.warn("APP", "MCU GET:MCU Timeout, retry " .. retry)
+        end
+
+        if not mcu_responded then
+            log.error("APP", "MCU Dead Detection")
+            last_mcu_alive = false
+            -- 连续三次超时，上报主板离线告警
+            as_tx(netc, next_id(), "EVT", "MD", modem_payload(false))
+        else
+            last_mcu_alive = true
+        end
+    end
+end
+
+-- Task 3: UART Listener for MCU Reports (Forwarding MR)
+-- 任务三：串口监听任务 (负责转发 MR 数据和协议确认)
+-- 实时接收 MCU 发来的 "MCU:..." 测量数据，并转发给服务器
+local function uart_task()
+    local pending_mid = nil
+    -- 订阅来自服务器命令任务关联的 MID
+    sys.subscribe("PENDING_SERVER_MID", function(mid) pending_mid = mid end)
+    
+    while true do
+        local result, line = sys.waitUntil("UART_RECV", 30000)
+        if result and line then
+            if string.sub(line, 1, 2) == "MA" then
+                -- V1.1 协议: 接收单片机上报的 MA,1,mid,EVT,MR,... 数据
+                local p6 = split_n(line, ",", 6)
+                if #p6 == 6 and p6[4] == "EVT" and p6[5] == "MR" then
+                    last_mcu_alive = true
+                    local mcu_mid = p6[3]
+                    local mcu_payload = p6[6]
+                    
+                    -- 在 devID=... 后面动态插入 4G 网关版本信息 (gv=4G2.0.0)
+                    local new_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. config.VERSION .. ";")
+                    
+                    local report_id = pending_mid or mcu_mid
+                    pending_mid = nil
+                    
+                    -- 转发完整测量结果到服务器
+                    as_tx(netc, report_id, "EVT", "MR", new_payload)
+                    
+                    -- 按照 V1.1 协议要求，给 MCU 回复 ACK 确认，防止 MCU 重发
+                    uart.send("AM,1," .. mcu_mid .. ",ACK,MR,devID=" .. imei .. ";ack=1\r\n")
+                end
+            elseif string.sub(line, 1, 4) == "MCU:" then
+                -- 兼容 V1.0 旧协议
+                last_mcu_alive = true
+                local report_id = pending_mid or next_id()
+                pending_mid = nil
+                
+                as_tx(netc, report_id, "EVT", "MR", mr_payload(line))
+                local mid_mcu = string.match(line, "mid=(%d+)") or "0000"
+                uart.send("AM,1," .. mid_mcu .. ",ACK,MR,devID=" .. imei .. ";ack=1\r\n")
+            elseif line == "ACK:0" then
+                -- 常见的 MCU 响应
+            end
+        end
+    end
+end
+
+-- 应用入口启动函数
 function app.start()
     led.init()
     uart.init()
     
-    local imei = ""
-    if mobile and mobile.imei then
-        imei = mobile.imei()
-    else
-        imei = "DEV888" -- Fallback
-    end
+    -- 临时固定模组的长串数字 ID 为 DEV 格式，方便与服务器联调
+    imei = "DEV8888"
     
-    -- Register UART receive handler
+    -- 注册串口底层数据接收回调并发布到 sys 消息中心
     uart.onReceive(function(line)
         log.info("UART_RX", line)
         sys.publish("UART_RECV", line)
     end)
     
-    sys.taskInit(function()
-        led.blink(200)
-        log.info("APP", "V3 Tracker Started. IMEI: " .. imei)
-        
-        if socket.localIP() == "0.0.0.0" or socket.localIP() == nil then
-            sys.waitUntil("IP_READY")
-        end
-        log.info("APP", "Network Ready")
-        
-        while true do
-            -- AWAKE CYCLE BEGINS
-            led.blink(200)
-            
-            -- Keep track of whether we sent a successful UDP message this cycle
-            local data_sent = false
-            
-            -- Setup UDP Socket
-            if config.SERVER_IP and config.SERVER_PORT then
-                netc = socket.create(nil, "udp_gps")
-                socket.config(netc, nil, true)
-                
-                -- Setup socket receive event (standard LuatOS socket.on)
-                socket.on(netc, function(id, event)
-                    if event == socket.EVENT_RX then
-                        local succ, data = socket.rx(netc)
-                        if succ and data and #data > 0 then
-                            log.info("UDP_RX", data)
-                            sys.publish("UDP_RECV", data)
-                        end
-                    end
-                end)
-                
-                local is_connected = socket.connect(netc, config.SERVER_IP, config.SERVER_PORT)
-                if is_connected then
-                    log.info("APP", "UDP Connected")
-                    
-                    -- 1. Trigger periodic MCU measurement.
-                    local mcu_alive = false
-                    for retry = 1, 3 do
-                        local cycle_id = next_id()
-                        pending_report_id = cycle_id
-                        log.info("APP", "Requesting MCU Data (Retry " .. retry .. ")")
-                        uart.send("GET:MCU\r\n")
-
-                        if wait_for_ack(2000) then
-                            mcu_alive = true
-                            break
-                        else
-                            pending_report_id = nil
-                        end
-                    end
-                    
-                    if not mcu_alive then
-                        -- MCU Dead Alert
-                        log.error("APP", "MCU is DEAD (3 timeouts)")
-                        local evt_id = next_id()
-                        as_tx(netc, evt_id, "EVT", "MD", modem_payload(imei, false))
-                        log.info("UDP_TX", "MCU Dead Alert via AS/MD")
-                    end
-
-                    last_mcu_alive = mcu_alive
-                    
-                    -- 2. Wait for Server Downlink Commands (Wait 5 seconds)
-                    log.info("APP", "Waiting 5s for Server Commands...")
-                    local end_time = os.time() + 5
-                    while os.time() < end_time do
-                        local result, udp_data = sys.waitUntil("UDP_RECV", 1000)
-                        if result and udp_data then
-                            if not handle_legacy_command(netc, imei, udp_data, mcu_alive) then
-                                local frame = parse_sa_frame(udp_data)
-                                if frame then
-                                    handle_sa_command(netc, imei, frame)
-                                end
-                            end
-                        end
-                        
-                        -- Also check if MCU initiated an unsolicited message.
-                        local ur, uline = sys.waitUntil("UART_RECV", 100)
-                        if ur and uline then
-                            if string.sub(uline, 1, 4) == "MCU:" then
-                                last_mcu_alive = true
-                                send_measure_event(netc, imei, uline)
-                                data_sent = true
-                            end
-                        end
-                    end
-                    
-                    socket.close(netc)
-                    netc = nil
-                else
-                    log.error("APP", "UDP Connect Failed")
-                end
-            end
-            
-            -- AWAKE CYCLE ENDS -> SLEEP
-            log.info("APP", "Sleep " .. (config.REPORT_INTERVAL/1000) .. "s")
-            pm.power(pm.WORK_MODE, config.POWER_MODE)
-            if config.POWER_MODE == 3 then
-                pm.dtimerStart(0, config.REPORT_INTERVAL)
-            end
-            sys.wait(config.REPORT_INTERVAL)
-        end
-    end)
+    -- 启动三大核心并行任务
+    sys.taskInit(network_task) -- 网络维持
+    sys.taskInit(timer_task)   -- 定时上报
+    sys.taskInit(uart_task)    -- 业务转发
     
-    -- Background task to catch and forward asynchronous MCU alarms when we are NOT in the active cycle
-    -- above, but the network is somehow still up or just to maintain logic.
+    -- 状态指示闪烁任务
     sys.taskInit(function()
         while true do
-            local result, line = sys.waitUntil("UART_RECV")
-            if result and line then
-                if netc == nil and string.sub(line, 1, 4) == "MCU:" then
-                    last_mcu_alive = true
-                    -- If we receive an async measurement while socket is closed,
-                    -- reopen a temporary socket and report it with AS protocol.
-                    log.info("APP", "Received ASYNC MCU Alert! Waking up socket.")
-                    send_measure_event_with_temp_socket(imei, line)
-                end
-            end
+            led.blink(100)
+            sys.wait(10000)
         end
     end)
 end
