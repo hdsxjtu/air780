@@ -197,8 +197,12 @@ local function find_set_param(payload_map)
 end
 
 -- 向 MCU 发送 AM 帧
+-- 协议 §3.4：MCU 可能处于休眠状态，必须先发 0x00 唤醒字节，
+-- 等待 10ms 使 MCU 完成唤醒，再发送正式帧内容。
 local function am_tx(mid, frame_type, cmd, payload)
     local message = build_frame("AM", mid, frame_type, cmd, payload)
+    uart.send("\x00")          -- 唤醒字节
+    sys.wait(10)               -- 等待 MCU 就绪
     uart.send(message .. "\r\n")
     log.info("UART_TX", message)
 end
@@ -314,12 +318,28 @@ local function timer_task()
         for retry = 1, 3 do
             local mid_mcu = next_id()
             am_tx(mid_mcu, "CMD", "MG", "devID=" .. imei)
-            local ack = wait_for_uart_line(2000, function(l) return l == "ACK:0" end)
-            if ack then
-                mcu_responded = true
-                break
+
+            -- 协议 §3.4：MCU 收到 MG/MS 命令必须立即回 MA,ACK,MG/MS
+            -- 4G 只以此帧作为 MCU 存活判定，不等 MR 数据（MR 是后续异步帧）
+            local end_time = mcu.ticks() + 2000
+            while mcu.ticks() < end_time do
+                local ok, line = sys.waitUntil("UART_RECV", 500)
+                if ok and line then
+                    local p6 = split_n(line, ",", 6)
+                    if #p6 >= 5 and p6[1] == "MA" and p6[4] == "ACK"
+                       and (p6[5] == "MG" or p6[5] == "MS") then
+                        -- 收到 MCU 对采样命令的即时 ACK → MCU 在线
+                        mcu_responded = true
+                        break
+                    elseif string.sub(line, 1, 2) == "MA" then
+                        -- 其他 MA 帧（如异步 EVT MR）：重新发布给 uart_task 处理
+                        sys.publish("UART_RECV", line)
+                    end
+                end
             end
-            log.warn("APP", "MCU GET:MCU Timeout, retry " .. retry)
+
+            if mcu_responded then break end
+            log.warn("APP", "MCU MG Timeout, retry " .. retry)
         end
 
         if not mcu_responded then
