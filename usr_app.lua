@@ -6,7 +6,7 @@ local uart = require("usr_uart")
 
 local app = {}
 local netc = nil
-local next_msg_id = 9000
+local next_msg_id = 3334
 local last_mcu_alive = true
 local imei = ""
 
@@ -64,11 +64,11 @@ local function split_n(str, sep, max_parts)
     return parts
 end
 
--- 生成下一个消息 ID (9000-9999 循环)
+-- 生成下一个消息 ID (3334-6666 循环，用于 4G 模组自主发起)
 local function next_id()
     next_msg_id = next_msg_id + 1
-    if next_msg_id > 9999 then
-        next_msg_id = 9000
+    if next_msg_id > 6666 then
+        next_msg_id = 3334
     end
     return tostring(next_msg_id)
 end
@@ -213,38 +213,26 @@ local function handle_sa_command(sock, frame)
     local payload_map = parse_payload(frame.payload)
     if payload_map.devID and payload_map.devID ~= imei then return end
 
-    if frame.cmd == "CG" then
-        -- 查询参数命令：改为发送 AM 帧
-        local mid_mcu = next_id()
-        am_tx(mid_mcu, "CMD", "CG", "devID=" .. imei)
-        local params = collect_config_params(5000)
-        if params then
-            as_tx(sock, frame.id, "RSP", "CG", "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";params=" .. params)
-        end
-    elseif frame.cmd == "CS" then
-        -- 设置参数命令：改为发送 AM 帧
-        local param_key, param_value
-        for k, v in pairs(payload_map) do
-            if k ~= "devID" and k ~= "gv" then param_key, param_value = k, v break end
-        end
-        if param_key and param_value then
-            local mid_mcu = next_id()
-            local payload = "devID=" .. imei .. ";" .. param_key .. "=" .. param_value
-            am_tx(mid_mcu, "CMD", "CS", payload)
-            local ack_line = wait_for_uart_line(3000, function(l)
-                return string.find(l, "RSP,CS") and string.find(l, "ack=1")
-            end)
-            as_tx(sock, frame.id, "RSP", "CS", "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=" .. (ack_line and "1" or "0"))
+    if frame.cmd == "CG" or frame.cmd == "CS" then
+        -- 设置/查询：透传服务器单号
+        am_tx(frame.id, "CMD", frame.cmd, frame.payload)
+        local ack_line = wait_for_uart_line(3000, function(l)
+            return string.find(l, "MA,1," .. frame.id) and string.find(l, ",RSP," .. frame.cmd)
+        end)
+        
+        if ack_line then
+            local p6 = split_n(ack_line, ",", 6)
+            as_tx(sock, frame.id, "RSP", frame.cmd, p6[6] or "")
+        else
+            as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=0")
         end
     elseif frame.cmd == "MS" or frame.cmd == "MG" then
-        -- 采样命令：不再盲目回 ACK，先下发给 MCU 确认状态
-        local mid_mcu = next_id()
-        am_tx(mid_mcu, "CMD", frame.cmd, "devID=" .. imei)
+        -- 采样命令：透传服务器单号，不再盲目回 ACK
+        am_tx(frame.id, "CMD", frame.cmd, "devID=" .. imei)
         
-        -- 等待 MCU 的第一个反馈（预期 1s 内，给 3s 超时）
-        -- 匹配：MA,1,mid,ACK,MS... 或 MA,1,mid,RSP,MS...
+        -- 等待 MCU 的第一个反馈
         local first_resp = wait_for_uart_line(3000, function(l)
-            return string.find(l, "MA,1," .. mid_mcu) and (string.find(l, ",ACK," .. frame.cmd) or string.find(l, ",RSP," .. frame.cmd))
+            return string.find(l, "MA,1," .. frame.id) and (string.find(l, ",ACK," .. frame.cmd) or string.find(l, ",RSP," .. frame.cmd))
         end)
         
         if first_resp then
@@ -375,48 +363,41 @@ local function timer_task()
     end
 end
 
--- Task 3: UART Listener for MCU Reports (Forwarding MR)
--- 任务三：串口监听任务 (负责转发 MR 数据和协议确认)
--- 实时接收 MCU 发来的 "MCU:..." 测量数据，并转发给服务器
+-- 任务三：串口监听任务 (负责转发所有从单片机主动或被动发回的数据)
 local function uart_task()
-    local pending_mid = nil
-    -- 订阅来自服务器命令任务关联的 MID
-    sys.subscribe("PENDING_SERVER_MID", function(mid) pending_mid = mid end)
-    
     while true do
         local result, line = sys.waitUntil("UART_RECV", 30000)
         if result and line then
-            if string.sub(line, 1, 2) == "MA" then
-                -- V1.1 协议: 接收单片机上报的 MA,1,mid,EVT,MR,... 数据
+            if string.find(line, "^MA,1,") then
+                -- V1.1 协议: 格式 MA,1,mid,type,cmd,payload
                 local p6 = split_n(line, ",", 6)
-                if #p6 == 6 and (p6[4] == "EVT" or p6[4] == "RSP") and p6[5] == "MR" then
-                    last_mcu_alive = true
+                if #p6 == 6 then
                     local mcu_mid = p6[3]
+                    local mcu_type = p6[4]
+                    local mcu_cmd = p6[5]
                     local mcu_payload = p6[6]
                     
-                    -- 在 devID=... 后面动态插入 4G 网关版本信息
-                    local new_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. config.VERSION .. ";")
+                    last_mcu_alive = true
                     
-                    local report_id = pending_mid or mcu_mid
-                    pending_mid = nil
-                    
-                    -- 转发完整测量结果到服务器 (保持原 frame_type 透传: EVT 或 RSP)
-                    as_tx(netc, report_id, p6[4], "MR", new_payload)
-                    
-                    -- 按照 V1.1 协议要求，给 MCU 回复 ACK 确认，防止 MCU 重发
-                    uart.send("AM,1," .. mcu_mid .. ",ACK,MR,devID=" .. imei .. ";ack=1\r\n")
+                    -- 处理测量结果（MR）的上送
+                    if mcu_cmd == "MR" then
+                        -- 插入 4G 模组版本信息（gv=...）
+                        local updated_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. config.VERSION .. ";")
+                        
+                        -- 透明转发：直接使用单片机带上来的 mid
+                        -- 若 mid 为 0001-3333 则为 MCU 事件，3334-6666 为 4G 定时任务，6667-9999 为服务器下发
+                        as_tx(netc, mcu_mid, mcu_type, "MR", updated_payload)
+                        
+                        -- 根据协议，MR 需要 4G 回应 ACK
+                        uart.send("AM,1," .. mcu_mid .. ",ACK,MR,devID=" .. imei .. ";ack=1\r\n")
+                    end
                 end
-            elseif string.sub(line, 1, 4) == "MCU:" then
+            elseif string.find(line, "^MCU:") then
                 -- 兼容 V1.0 旧协议
                 last_mcu_alive = true
-                local report_id = pending_mid or next_id()
-                pending_mid = nil
-                
-                as_tx(netc, report_id, "EVT", "MR", mr_payload(line))
+                as_tx(netc, next_id(), "EVT", "MR", mr_payload(line))
                 local mid_mcu = string.match(line, "mid=(%d+)") or "0000"
                 uart.send("AM,1," .. mid_mcu .. ",ACK,MR,devID=" .. imei .. ";ack=1\r\n")
-            elseif line == "ACK:0" then
-                -- 常见的 MCU 响应
             end
         end
     end
