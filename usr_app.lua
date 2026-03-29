@@ -214,7 +214,18 @@ local function handle_sa_command(sock, frame)
     if payload_map.devID and payload_map.devID ~= imei then return end
 
     if frame.cmd == "CG" or frame.cmd == "CS" then
-        -- 设置/查询：透传服务器单号
+        -- 捕捉 RPT_INT 指令并同步更新 4G 模组自身的定时频率
+        if frame.cmd == "CS" then
+            if payload_map.RPT_INT then
+                config.REPORT_INTERVAL = tonumber(payload_map.RPT_INT) * 60 * 1000
+                log.info("APP", "Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
+            elseif payload_map.REPORT_INTERVAL then
+                config.REPORT_INTERVAL = tonumber(payload_map.REPORT_INTERVAL) * 60 * 1000
+                log.info("APP", "Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
+            end
+        end
+
+        -- 设置/查询：透传服务器单号给单片机（单片机也会存一份副本）
         am_tx(frame.id, "CMD", frame.cmd, frame.payload)
         local ack_line = wait_for_uart_line(3000, function(l)
             return string.find(l, "MA,1," .. frame.id) and string.find(l, ",RSP," .. frame.cmd)
@@ -316,32 +327,27 @@ local function network_task()
     end
 end
 
--- Task 2: Periodic MCU Data Request (Timer-based)
--- 任务二：定时上报任务
--- 根据 RPT_INT 时间定期请求 MCU 数据，监控 MCU 是否在线
+-- Task 2: Periodic MCU Data Request (Timer-based, High Power)
+-- 任务二：定时上报任务（由于涉及单片机唤醒和传感器测量，设置为长周期，如 1 小时）
 local function timer_task()
     while true do
         sys.wait(config.REPORT_INTERVAL)
-        log.info("APP", "Periodic Report Cycle")
+        log.info("APP", "Long Period Measurement Cycle")
         
         local mcu_responded = false
         for retry = 1, 3 do
             local mid_mcu = next_id()
             am_tx(mid_mcu, "CMD", "MG", "devID=" .. imei)
 
-            -- 协议 §3.4：MCU 收到 MG/MS 命令必须立即回 MA,ACK,MG/MS
-            -- 4G 只以此帧作为 MCU 存活判定，不等 MR 数据（MR 是后续异步帧）
             local end_time = mcu.ticks() + 2000
             while mcu.ticks() < end_time do
                 local ok, line = sys.waitUntil("UART_RECV", 500)
                 if ok and line then
                     local p6 = split_n(line, ",", 6)
-                    if #p6 >= 5 and p6[1] == "MA" and p6[4] == "ACK"
-                       and (p6[5] == "MG" or p6[5] == "MS") then
-                        -- 收到 MCU 对采样命令的即时 ACK → MCU 在线
+                    if #p6 >= 5 and p6[1] == "MA" and p6[4] == "ACK" and (p6[5] == "MG" or p6[5] == "MS") then
                         mcu_responded = true
                         break
-                    elseif string.sub(line, 1, 2) == "MA" then
+                    elseif string.find(line, "^MA,1,") then
                         -- 其他 MA 帧（如异步 EVT MR）：重新发布给 uart_task 处理
                         sys.publish("UART_RECV", line)
                     end
@@ -360,6 +366,21 @@ local function timer_task()
         else
             last_mcu_alive = true
         end
+    end
+end
+
+-- Task 2.5: Lightweight Link Maintenance (Heartbeat, Low Power)
+-- 任务 2.5：链路维持心跳（仅 4G 发包，不唤醒单片机，频率建议 2 分钟）
+local function heartbeat_task()
+    while true do
+        sys.wait(config.HEARTBEAT_INTERVAL)
+        -- 仅在网络连接正常时发送心跳报文 (MD: Link Check)
+        if netc then
+            log.info("APP", "Heartbeat: Keep NAT Alive")
+            as_tx(netc, next_id(), "RSP", "MD", modem_payload(last_mcu_alive))
+        end
+        -- 提醒模组进入轻度休眠（Light Sleep）
+        pm.request(pm.LIGHT_SLEEP)
     end
 end
 
@@ -417,10 +438,11 @@ function app.start()
         sys.publish("UART_RECV", line)
     end)
     
-    -- 启动三大核心并行任务
-    sys.taskInit(network_task) -- 网络维持
-    sys.taskInit(timer_task)   -- 定时上报
-    sys.taskInit(uart_task)    -- 业务转发
+    -- 启动核心并行任务
+    sys.taskInit(network_task)   -- 网络维持
+    sys.taskInit(heartbeat_task) -- 链路心跳（轻量）
+    sys.taskInit(timer_task)     -- 定时上报（重量）
+    sys.taskInit(uart_task)      -- 业务转发
     
     -- 状态指示闪烁任务
     sys.taskInit(function()
