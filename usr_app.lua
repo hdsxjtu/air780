@@ -231,17 +231,39 @@ local function handle_sa_command(sock, frame)
             local mid_mcu = next_id()
             local payload = "devID=" .. imei .. ";" .. param_key .. "=" .. param_value
             am_tx(mid_mcu, "CMD", "CS", payload)
-            local ack_line = wait_for_uart_line(3000, function(l) return l == "ACK:0" end)
-            as_tx(sock, frame.id, "RSP", "CS", "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=" .. (ack_line and "0" or "1"))
+            local ack_line = wait_for_uart_line(3000, function(l)
+                return string.find(l, "RSP,CS") and string.find(l, "ack=1")
+            end)
+            as_tx(sock, frame.id, "RSP", "CS", "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=" .. (ack_line and "1" or "0"))
         end
     elseif frame.cmd == "MS" or frame.cmd == "MG" then
-        -- 采样命令：先回 ACK，触发测量后再等 MR 上报
-        as_tx(sock, frame.id, "ACK", frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=1")
-        
+        -- 采样命令：不再盲目回 ACK，先下发给 MCU 确认状态
         local mid_mcu = next_id()
         am_tx(mid_mcu, "CMD", frame.cmd, "devID=" .. imei)
-        -- 将服务器的 MID 发布出去，让串口监听任务能关联上报
-        sys.publish("PENDING_SERVER_MID", frame.id)
+        
+        -- 等待 MCU 的第一个反馈（预期 1s 内，给 3s 超时）
+        -- 匹配：MA,1,mid,ACK,MS... 或 MA,1,mid,RSP,MS...
+        local first_resp = wait_for_uart_line(3000, function(l)
+            return string.find(l, "MA,1," .. mid_mcu) and (string.find(l, ",ACK," .. frame.cmd) or string.find(l, ",RSP," .. frame.cmd))
+        end)
+        
+        if first_resp then
+            local p6 = split_n(first_resp, ",", 6)
+            local mcu_type = p6[4] or "RSP"
+            local mcu_payload = parse_payload(p6[6])
+            local mcu_ack = mcu_payload.ack or "0"
+            
+            -- 将 MCU 的真实状态（受理或拒绝）透传给服务器
+            as_tx(sock, frame.id, mcu_type, frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=" .. mcu_ack)
+            
+            -- 只有当 MCU 明确回复 ACK(ack=1) 时，才建立 PENDING_SERVER_MID 关联，等待后续 MR
+            if mcu_type == "ACK" and mcu_ack == "1" then
+                sys.publish("PENDING_SERVER_MID", frame.id)
+            end
+        else
+            -- 串口超时无应答，向上位机回复拒绝执行
+            as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=0")
+        end
     elseif frame.cmd == "MD" then
         -- 链路查询命令
         as_tx(sock, frame.id, "RSP", "MD", modem_payload(last_mcu_alive))
@@ -367,19 +389,19 @@ local function uart_task()
             if string.sub(line, 1, 2) == "MA" then
                 -- V1.1 协议: 接收单片机上报的 MA,1,mid,EVT,MR,... 数据
                 local p6 = split_n(line, ",", 6)
-                if #p6 == 6 and p6[4] == "EVT" and p6[5] == "MR" then
+                if #p6 == 6 and (p6[4] == "EVT" or p6[4] == "RSP") and p6[5] == "MR" then
                     last_mcu_alive = true
                     local mcu_mid = p6[3]
                     local mcu_payload = p6[6]
                     
-                    -- 在 devID=... 后面动态插入 4G 网关版本信息 (gv=4G2.0.0)
+                    -- 在 devID=... 后面动态插入 4G 网关版本信息
                     local new_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. config.VERSION .. ";")
                     
                     local report_id = pending_mid or mcu_mid
                     pending_mid = nil
                     
-                    -- 转发完整测量结果到服务器
-                    as_tx(netc, report_id, "EVT", "MR", new_payload)
+                    -- 转发完整测量结果到服务器 (保持原 frame_type 透传: EVT 或 RSP)
+                    as_tx(netc, report_id, p6[4], "MR", new_payload)
                     
                     -- 按照 V1.1 协议要求，给 MCU 回复 ACK 确认，防止 MCU 重发
                     uart.send("AM,1," .. mcu_mid .. ",ACK,MR,devID=" .. imei .. ";ack=1\r\n")
