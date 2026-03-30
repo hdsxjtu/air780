@@ -288,6 +288,10 @@ function app.start()
         if mobile and mobile.sleepMode then
             mobile.sleepMode(0) -- 强制关闭休眠，确保调试稳定
         end
+    else
+        if mobile and mobile.sleepMode then
+            mobile.sleepMode(config.POWER_MODE) -- 启用休眠（例如 1 代表浅休眠）
+        end
     end
     uart.onReceive(function(line) sys.publish("UART_RECV", line) end)
     sys.taskInit(network_task); sys.taskInit(heartbeat_task)

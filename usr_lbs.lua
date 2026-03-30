@@ -2,7 +2,9 @@
 -- Service for Base Station Positioning
 
 local sys = require("sys")
-local lbsLoc = require("lbsLoc")
+local success_lbs, lbsLoc = pcall(require, "lbsLoc")
+if not success_lbs then lbsLoc = nil end
+local mobile = _G.mobile
 local config = require("usr_config")
 
 local lbs = {}
@@ -11,12 +13,16 @@ local lbs = {}
 -- Returns: result_code, lat, lng, addr
 function lbs.getLocation()
     -- 1. Trigger cell info update (Required for LBS in new firmware)
-    mobile.reqCellInfo(15)
-    
-    -- 2. Wait for update
-    local result = sys.waitUntil("CELL_INFO_UPDATE", config.LBS_TIMEOUT)
-    if not result then
-        log.warn("LBS", "Cell Info Update Timed Out")
+    if mobile and mobile.reqCellInfo then
+        mobile.reqCellInfo(15)
+        
+        -- 2. Wait for update
+        local result = sys.waitUntil("CELL_INFO_UPDATE", config.LBS_TIMEOUT)
+        if not result then
+            log.warn("LBS", "Cell Info Update Timed Out")
+        end
+    else
+        log.warn("LBS", "Mobile/LBS hardware not available on this platform")
     end
     
     -- DEBUG: Print cell info (Simplified)
@@ -24,6 +30,8 @@ function lbs.getLocation()
     -- if not cell_info then log.warn("LBS", "No Cell Info") end
     
     -- 3. Request LBS
+    if not lbsLoc then return -99, 0, 0 end
+    
     local ret_lat, ret_lng, ret_result = nil, nil, -1
     
     -- Wrap asynchronous callback into a synchronous wait
