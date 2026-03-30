@@ -27,6 +27,7 @@ config.POWER_MODE      = 1 -- Light Sleep：保持网络在线，服务器可随
 -- Timing Configuration
 config.HEARTBEAT_INTERVAL = 5 * 60 * 1000 -- 【轻量】心跳周期间隔 (ms)，仅维持 UDP 映射，建议 5 分钟。固定值，与 RPT_INT 无关。
 config.REPORT_INTERVAL    = 60 * 60 * 1000 -- 【重量】定时采样间隔 (ms)，唤醒 MCU 采气。对应协议中的 RPT_INT 参数，单位：分钟（此处默认 60m）。
+config.ADDR               = 1              -- 【配置】设备物理地址（site_id），与单片机同步。
 config.LBS_TIMEOUT        = 30000          -- LBS 定位超时
 
 return config
