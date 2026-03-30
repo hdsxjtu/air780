@@ -4,6 +4,7 @@ local led = require("usr_led")
 local lbs = require("usr_lbs")
 local uart = require("usr_uart")
 local proto = require("usr_protocol")
+local mobile = _G.mobile
 
 -- ========================================================================
 -- 核心架构说明 (Architecture Overview):
@@ -16,6 +17,8 @@ local netc = nil            -- 全局网络连接句柄 (UDP Socket)
 local last_mcu_alive = true -- 记录单片机是否正常（心跳用）
 local last_lat, last_lng = nil, nil -- GPS/LBS 坐标缓存
 local mcu_is_busy = false    -- 业务锁：记录当前模组是否正占用串口与单片机交互
+local boot_synced = false    -- 握手标志：开机由于系统响应解锁
+local last_mcu_ready = false -- 记录开机握手是否真正成功
 
 -- [[ 内部逻辑：静默刷新 GPS 缓存 ]]
 local function update_gps_cache()
@@ -33,10 +36,11 @@ local function handle_sa_command(sock, frame)
     if frame.type ~= "CMD" then return end
     local payload_map = proto.parse_payload(frame.payload)
     
-    -- 1. 模组忙阻判定
-    if mcu_is_busy then
-        log.warn("APP", "System Busy, rejecting SA command: " .. (frame.cmd or "N/A"))
-        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
+    -- 1. 模组忙阻判定 (同步未完成或正在进行业务)
+    local current_devid = "DEV" .. (config.ADDR or "0")
+    if not boot_synced or mcu_is_busy then
+        log.warn("APP", "System Startup/Busy, rejecting SA command: " .. (frame.id or "N/A"))
+        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_BUSY)
         return
     end
 
@@ -113,31 +117,45 @@ local function network_task()
             sys.waitUntil("IP_READY")
         end
         log.info("APP", "Network Ready, connecting to " .. config.SERVER_IP)
-        netc = socket.create(nil, "udp_app")
+        
+        local rxbuff = zbuff.create(1024)
+        netc = socket.create(nil, function(sc, event)
+            log.info("udp_event", string.format("%08X", event))
+            
+            -- 注意：demo 中使用的是 socket.EVENT (或者是具体的 RX 常量)
+            -- 只要有事件进来，由于是无连接的 UDP，大概率是收到了数据
+            if event == socket.EVENT or event == socket.EVENT_RX or event == socket.EVENT_RECV then
+                -- 在调用底层 rx 之前，强制将游标复位到 0！
+                -- 因为 clear() 在某些旧固件中仅仅清空内容但不移动游标，导致第二包追加到了第一包后面
+                rxbuff:seek(0, 0) 
+                
+                local ok, len = socket.rx(sc, rxbuff)
+                if ok and len and len > 0 then
+                    local data = rxbuff:toStr(0, len)
+                    log.info("UDP_RX", "Len: " .. tostring(len) .. " Data: " .. tostring(data))
+                    
+                    if type(data) == "string" and #data > 0 then
+                        local frame = proto.parse_sa_frame(data)
+                        if frame then 
+                            sys.publish("SA_FRAME_RX", frame) -- 解耦：推送到独立协程处理
+                        else
+                            log.error("UDP_RX", "Parse failed. Not a valid SA frame.")
+                        end
+                    end
+                else
+                    log.warn("UDP_RX", "socket.rx returned failure")
+                end
+            elseif event == socket.EVENT_CLOSE then
+                log.error("UDP_EVENT", "Socket closed by remote or network!")
+                sys.publish("SOCKET_CLOSED")
+            end
+        end)
+        
         socket.config(netc, nil, true)
 
-        if socket.on then
-            socket.on(netc, function(id, event)
-                if event == socket.EVENT_RX then
-                    local succ, data = socket.rx(netc)
-                    if succ and type(data) == "string" and #data > 0 then
-                        local frame = proto.parse_sa_frame(data)
-                        if frame then handle_sa_command(netc, frame) end
-                    end
-                elseif event == socket.EVENT_CLOSE then
-                    sys.publish("SOCKET_CLOSED")
-                end
-            end)
-            
-            sys.taskInit(function()
-                sys.wait(2000)
-                local current_devid = "DEV" .. (config.ADDR or "0")
-                proto.am_tx(proto.next_id(), "CMD", "CG", "devID=" .. current_devid)
-            end)
-        end
-
         if socket.connect(netc, config.SERVER_IP, config.SERVER_PORT) then
-            pm.power(pm.WORK_MODE, config.POWER_MODE)
+            -- 成功连接服务器
+            sys.publish("SOCKET_CONNECTED")
             sys.waitUntil("SOCKET_CLOSED", 86400000)
         else
             sys.wait(5000)
@@ -148,72 +166,82 @@ end
 
 -- [[ 任务 2：定时上报任务 ]]
 local function timer_task()
-    while true do
-        sys.wait(config.REPORT_INTERVAL) -- 恢复报表周期等待
-        log.info("APP", "--- Starting Periodic Reporting Cycle ---")
-        
+    -- 第一阶段：开机强制同步 (100% 解决地址/间隔未知问题)
+    sys.waitUntil("SOCKET_CONNECTED")
+    log.info("APP", "Network Ready. Starting Initial MCU Handshake...")
+    
+    mcu_is_busy = true
+    for i = 1, 20 do
+        log.info("APP", "Syncing Config Attempt " .. i .. "/20")
         local current_devid = "DEV" .. (config.ADDR or "0")
-
-        -- 等待直到模组业务空闲（最多等 10 秒，通常不会发生）
-        local wait_count = 0
-        while mcu_is_busy and wait_count < 20 do
-            sys.wait(500)
-            wait_count = wait_count + 1
-        end
-        mcu_is_busy = true
-
-        -- 1. 同步参数 (CG)
-        log.info("APP", "Step 1: Syncing Config from MCU")
-        local sync_line = proto.request_mcu(proto.next_id(), "CG", "devID=" .. current_devid, 1500, 3)
+        local sync_line = proto.request_mcu(proto.next_id(), "CG", "devID=" .. current_devid, 1000, 1)
+        
         if sync_line then
             local p6 = proto.split_n(sync_line, ",", 6)
             local mcu_map = proto.parse_payload(p6[6])
             if mcu_map.ADDR then config.ADDR = tonumber(mcu_map.ADDR) end
             if mcu_map.RPT_INT then config.REPORT_INTERVAL = tonumber(mcu_map.RPT_INT) * 60 * 1000 end
-            log.info("APP", "Sync Success. ADDR=" .. config.ADDR)
-            last_mcu_alive = true
-        else
-            log.warn("APP", "Sync Failed after retries")
-            -- 如果同步失败，暂时不判定离线，留给 MG 去判定
+            log.info("APP", "Initial Sync SUCCESS. Correct ADDR=" .. config.ADDR)
+            last_mcu_ready = true
+            break
         end
+        sys.wait(1000)
+    end
+    mcu_is_busy = false
+    boot_synced = true            -- 无论是否成功同步，都解锁系统响应，防止模组死等
+    sys.publish("BOOT_SYNC_DONE") -- 通知心跳任务可以开始了
 
-        -- 2. 采集定位 (GPS/LBS)
-        log.info("APP", "Step 2: Collecting LBS Location")
+    if not last_mcu_ready then
+        log.error("APP", "Initial Sync FAILED after 20 tries - Using default config")
+        -- 这里不再重复发送离线状态，因为紧接着第二阶段就会跑一次带 LBS 定位的完整检测，
+        -- 如果单片机依然离线，下面会把带着经纬度的完美离线状态打包发过去。
+    end
+
+    -- 第二阶段：正常周期循环 (开机立即执行一次 MG)
+    while true do
+        log.info("APP", "--- Starting Reporting Cycle ---")
+        local current_devid = "DEV" .. (config.ADDR or "0")
+
+        -- 2. 同步定位 (解开忙锁，避免基站定位的 10~30 秒内拒接服务器指令)
         local res, lat, lng = lbs.getLocation()
-        if res == 0 then
-            log.info("APP", "LBS Fix: " .. lat .. "," .. lng)
-            last_lat, last_lng = lat, lng -- 仅更新缓存，供 MD 查询使用
-        else
-            log.warn("APP", "LBS Fail: " .. res)
-        end
+        if res == 0 then last_lat, last_lng = lat, lng end
+
+        -- 1. 等待串口业务空闲并上锁
+        local wait_count = 0
+        while mcu_is_busy and wait_count < 20 do sys.wait(500) wait_count = wait_count + 1 end
+        mcu_is_busy = true
 
         -- 3. 触发采样 (MG)
-        log.info("APP", "Step 3: Triggering MCU Measurement")
+        log.info("APP", "Triggering MCU Measurement")
         local mg_resp = proto.request_mcu(proto.next_id(), "MG", "devID=" .. current_devid, 1500, 3)
-        local mcu_responded = (mg_resp ~= nil)
+        last_mcu_alive = (mg_resp ~= nil)
 
-        if not mcu_responded then
-            log.error("APP", "MCU Offline confirmed after 3 retries")
-            last_mcu_alive = false
-            -- 主动离线告警：带上位置信息
+        if not last_mcu_alive then
+            log.error("APP", "MCU Offline confirmed")
             proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, false, last_lat, last_lng))
-        else
-            last_mcu_alive = true
         end
 
         mcu_is_busy = false
+        
+        -- 4. 周期休眠
+        log.info("APP", "Cycle finished. Sleeping for " .. (config.REPORT_INTERVAL / 60000) .. " min")
+        sys.wait(config.REPORT_INTERVAL)
     end
 end
 
 -- [[ 任务 3：链路维持心跳 ]]
 local function heartbeat_task()
+    -- 心跳也要等待首次握手结果，否则发出的 devID 可能是错的
+    sys.waitUntil("BOOT_SYNC_DONE")
+    
     while true do
         sys.wait(config.HEARTBEAT_INTERVAL)
         if netc then
-            local current_devid = "DEV" .. (config.ADDR or "0")
-            proto.as_tx(netc, proto.next_id(), "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive))
+            -- 极简保活机制：仅仅发送最轻量的 4字节 数据，维持基站 UDP NAT 洞口常开
+            -- 服务器可以丢弃此包。这满足了低功耗且“不看满屏数据”的需求。
+            local keepalive = "ping"
+            socket.tx(netc, keepalive)
         end
-        pm.request(pm.LIGHT_SLEEP)
     end
 end
 
@@ -244,11 +272,26 @@ local function uart_task()
     end
 end
 
+-- [[ 任务 5：下发指令处理任务 (协程解耦) ]]
+local function sa_command_task()
+    while true do
+        local result, frame = sys.waitUntil("SA_FRAME_RX")
+        if result and frame and netc then
+            handle_sa_command(netc, frame)
+        end
+    end
+end
+
 function app.start()
     led.init(); uart.init()
+    if config.POWER_MODE == 0 then
+        if mobile and mobile.sleepMode then
+            mobile.sleepMode(0) -- 强制关闭休眠，确保调试稳定
+        end
+    end
     uart.onReceive(function(line) sys.publish("UART_RECV", line) end)
     sys.taskInit(network_task); sys.taskInit(heartbeat_task)
-    sys.taskInit(timer_task); sys.taskInit(uart_task)
+    sys.taskInit(timer_task); sys.taskInit(uart_task); sys.taskInit(sa_command_task)
     sys.taskInit(function() while true do led.blink(100); sys.wait(10000) end end)
 end
 

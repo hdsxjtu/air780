@@ -1,14 +1,16 @@
 local sys = require("sys")
 local config = require("usr_config")
-local mobile = require("mobile")
+local mobile = _G.mobile
 local uart = require("usr_uart")
 
 local proto = {}
 
 -- 协议 ACK 状态码定义 (§3.7)
-proto.ACK_OFFLINE     = "0" -- 单片机未响应或忙碌
+proto.ACK_BUSY        = "0" -- 单片机测气中或串口占用 (建议重试)
 proto.ACK_SUCCESS     = "1" -- 指令执行成功/已受理
 proto.ACK_ID_MISMATCH = "2" -- 设备 ID 不匹配，拒绝执行
+proto.ACK_ERROR       = "3" -- 指令格式错误或参数越界 (不建议重试)
+proto.ACK_OFFLINE     = "4" -- 单片机无响应/已离线 (4G返回)
 
 local uart_locked = false
 local next_msg_id = 3334    -- mid 计数器 (3334-6666 用于模组主动心跳)
@@ -154,8 +156,6 @@ function proto.am_tx(mid, frame_type, cmd, payload)
     uart_locked = true
     
     local message = proto.build_frame("AM", mid, frame_type, cmd, payload)
-    uart.send("\x00")
-    sys.wait(10)
     uart.send(message .. "\r\n")
     log.info("UART_TX", message)
     
