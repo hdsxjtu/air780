@@ -155,6 +155,10 @@ function proto.am_tx(mid, frame_type, cmd, payload)
     end
     uart_locked = true
     
+    -- 强制前置 0x00 唤醒脉冲，等待 MCU 晶振起振和 LPUART 唤醒 (10ms左右)
+    uart.send(string.char(0x00))
+    sys.wait(10)
+    
     local message = proto.build_frame("AM", mid, frame_type, cmd, payload)
     uart.send(message .. "\r\n")
     log.info("UART_TX", message)

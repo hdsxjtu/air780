@@ -237,10 +237,10 @@ local function heartbeat_task()
     while true do
         sys.wait(config.HEARTBEAT_INTERVAL)
         if netc then
-            -- 极简保活机制：仅仅发送最轻量的 4字节 数据，维持基站 UDP NAT 洞口常开
-            -- 服务器可以丢弃此包。这满足了低功耗且“不看满屏数据”的需求。
-            local keepalive = "ping"
-            socket.tx(netc, keepalive)
+            local current_devid = "DEV" .. (config.ADDR or "0")
+            -- 回归标准协议心跳（不带经纬度以省电），确保在工具中“看得见”
+            log.info("TRACE", "---- SECRECY HEARTBEAT SENDING NOW ----")
+            proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, last_mcu_alive, nil, nil))
         end
     end
 end
@@ -259,12 +259,9 @@ local function uart_task()
                         local updated_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. config.VERSION .. ";")
                         proto.as_tx(netc, mcu_mid, mcu_type, "MR", updated_payload)
                         
-                        -- ACK 受保护发送
-                        local current_devid = "DEV" .. (config.ADDR or "0")
-                        while proto.is_uart_locked() do sys.waitUntil("UART_UNLOCK", 100) end
-                        proto.set_uart_locked(true)
-                        uart.send("AM,1," .. mcu_mid .. ",ACK,MR,devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. "\r\n")
-                        proto.set_uart_locked(false)
+                        -- ACK 直接调用协议统一下发 (内置 0x00 唤醒及保护)
+                        local real_devid = "DEV" .. (config.ADDR or "0")
+                        proto.am_tx(mcu_mid, "ACK", "MR", "devID=" .. real_devid .. ";ack=" .. proto.ACK_SUCCESS)
                     end
                 end
             end
@@ -284,14 +281,8 @@ end
 
 function app.start()
     led.init(); uart.init()
-    if config.POWER_MODE == 0 then
-        if mobile and mobile.sleepMode then
-            mobile.sleepMode(0) -- 强制关闭休眠，确保调试稳定
-        end
-    else
-        if mobile and mobile.sleepMode then
-            mobile.sleepMode(config.POWER_MODE) -- 启用休眠（例如 1 代表浅休眠）
-        end
+    if config.POWER_MODE > 0 then
+        pm.request(pm.LIGHT) -- 恢复为您最熟悉的 PM 库底座控制
     end
     uart.onReceive(function(line) sys.publish("UART_RECV", line) end)
     sys.taskInit(network_task); sys.taskInit(heartbeat_task)
