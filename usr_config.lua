@@ -16,7 +16,7 @@ config.VERSION         = "1.0.0"
 
 -- Hardware Definitions
 config.LED_PIN         = 27 -- GPIO 27 (NetStatus)
-config.UART_ID         = 1 -- 主 UART
+config.UART_ID         = 15 -- 主 UART
 config.UART_BAUD       = 9600 -- 9600波特率可唤醒MCU的LPUART Stop模式
 
 -- Power Management

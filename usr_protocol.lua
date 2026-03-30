@@ -104,14 +104,46 @@ end
 
 -- [[ 核心逻辑：等待串口回复 ]]
 function proto.wait_for_uart_line(timeout_ms, matcher)
-    local end_time = mcu.ticks() + timeout_ms
+    local end_time = mcu.ticks() + (timeout_ms or 1500)
     while mcu.ticks() < end_time do
-        local ok, line = sys.waitUntil("UART_RECV", 500)
-        if ok and line and matcher(line) then
-            return line
+        -- 缩短单次订阅时间为 200ms，以提高响应灵敏度
+        local ok, line = sys.waitUntil("UART_RECV", 200)
+        if ok and line then
+            if matcher(line) then
+                return line
+            else
+                -- 如果收到了 MA 开头的帧但不是当前请求等待的，重新发布，防止丢包
+                if string.find(line, "^MA,1,") then
+                    sys.publish("UART_RECV", line)
+                end
+            end
         end
     end
     return nil
+end
+
+-- [[ 高级逻辑：带重试的 MCU 请求 (3 次尝试，每次 1.5s) ]]
+function proto.request_mcu(mid, cmd, payload, timeout_ms, retries)
+    local max_retries = retries or 3
+    local wait_ms = timeout_ms or 1500
+    
+    for i = 1, max_retries do
+        log.info("PROTO", "MCU Request: " .. cmd .. " (Try " .. i .. "/" .. max_retries .. ")")
+        proto.am_tx(mid, "CMD", cmd, payload)
+        
+        local resp = proto.wait_for_uart_line(wait_ms, function(l)
+            -- 寻找符合当前指令和 MID 的 RSP 或 ACK
+            return string.find(l, "MA,1," .. mid) and (string.find(l, ",RSP," .. cmd) or string.find(l, ",ACK," .. cmd))
+        end)
+        
+        if resp then
+            return resp -- 成功拿到应答，直接返回
+        end
+        log.warn("PROTO", "MCU Request Timeout: " .. cmd .. " (Attempt " .. i .. " failed)")
+    end
+    
+    log.error("PROTO", "MCU Request Failed: " .. cmd .. " after " .. max_retries .. " retries")
+    return nil -- 三次全失败
 end
 
 -- [[ 核心逻辑：带资源保护的串口发送 ]]

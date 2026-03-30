@@ -15,6 +15,7 @@ local app = {}
 local netc = nil            -- 全局网络连接句柄 (UDP Socket)
 local last_mcu_alive = true -- 记录单片机是否正常（心跳用）
 local last_lat, last_lng = nil, nil -- GPS/LBS 坐标缓存
+local mcu_is_busy = false    -- 业务锁：记录当前模组是否正占用串口与单片机交互
 
 -- [[ 内部逻辑：静默刷新 GPS 缓存 ]]
 local function update_gps_cache()
@@ -32,7 +33,14 @@ local function handle_sa_command(sock, frame)
     if frame.type ~= "CMD" then return end
     local payload_map = proto.parse_payload(frame.payload)
     
-    -- 1. 严格 ID 校验 (基准：config.ADDR)
+    -- 1. 模组忙阻判定
+    if mcu_is_busy then
+        log.warn("APP", "System Busy, rejecting SA command: " .. (frame.cmd or "N/A"))
+        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
+        return
+    end
+
+    -- 2. 严格 ID 校验 (基准：config.ADDR)
     local current_devid = "DEV" .. (config.ADDR or "0")
     if payload_map.devID and payload_map.devID ~= current_devid then
         log.error("APP", "ID Mismatch: expected " .. current_devid .. " but got " .. payload_map.devID)
@@ -40,7 +48,8 @@ local function handle_sa_command(sock, frame)
         return 
     end
 
-    -- 2. 针对 CG/CS 指令的处理
+    -- 3. 针对 CG/CS 指令的处理
+    mcu_is_busy = true
     if frame.cmd == "CG" or frame.cmd == "CS" then
         if frame.cmd == "CS" then
             if payload_map.RPT_INT then
@@ -54,35 +63,28 @@ local function handle_sa_command(sock, frame)
             end
         end
 
-        proto.am_tx(frame.id, "CMD", frame.cmd, frame.payload)
+        local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 1500, 3)
         
-        local ack_line = proto.wait_for_uart_line(3000, function(l)
-            return string.find(l, "MA,1," .. frame.id) and string.find(l, ",RSP," .. frame.cmd)
-        end)
-        
-        if ack_line then
-            local p6 = proto.split_n(ack_line, ",", 6)
+        if resp_line then
+            local p6 = proto.split_n(resp_line, ",", 6)
             local mcu_payload = p6[6] or ""
-            if mcu_map.ADDR then config.ADDR = tonumber(mcu_map.ADDR) end
-            
+            last_mcu_alive = true
             proto.as_tx(sock, frame.id, "RSP", frame.cmd, mcu_payload)
         else
+            last_mcu_alive = false
             proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
         end
 
     -- 3. 针对 MS/MG 指令的处理 (二阶段 ACK)
     elseif frame.cmd == "MS" or frame.cmd == "MG" then
-        proto.am_tx(frame.id, "CMD", frame.cmd, "devID=" .. current_devid)
-        
-        local first_resp = proto.wait_for_uart_line(3000, function(l)
-            return string.find(l, "MA,1," .. frame.id) and (string.find(l, ",ACK," .. frame.cmd) or string.find(l, ",RSP," .. frame.cmd))
-        end)
+        local first_resp = proto.request_mcu(frame.id, frame.cmd, "devID=" .. current_devid, 1500, 3)
         
         if first_resp then
             local p6 = proto.split_n(first_resp, ",", 6)
             local mcu_type = p6[4] or "RSP"
             local mcu_payload = proto.parse_payload(p6[6])
             local mcu_ack = mcu_payload.ack or "0"
+            last_mcu_alive = true
             
             proto.as_tx(sock, frame.id, mcu_type, frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. mcu_ack)
             
@@ -90,12 +92,14 @@ local function handle_sa_command(sock, frame)
                 sys.publish("PENDING_SERVER_MID", frame.id)
             end
         else
+            last_mcu_alive = false
             proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
         end
     elseif frame.cmd == "MD" then
         update_gps_cache() -- 仅在查状态时触发静默刷新
         proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, last_lat, last_lng))
     end
+    mcu_is_busy = false
 end
 
 -- ========================================================================
@@ -145,17 +149,22 @@ end
 -- [[ 任务 2：定时上报任务 ]]
 local function timer_task()
     while true do
-        sys.wait(config.REPORT_INTERVAL)
+        sys.wait(config.REPORT_INTERVAL) -- 恢复报表周期等待
         log.info("APP", "--- Starting Periodic Reporting Cycle ---")
         
         local current_devid = "DEV" .. (config.ADDR or "0")
 
+        -- 等待直到模组业务空闲（最多等 10 秒，通常不会发生）
+        local wait_count = 0
+        while mcu_is_busy and wait_count < 20 do
+            sys.wait(500)
+            wait_count = wait_count + 1
+        end
+        mcu_is_busy = true
+
         -- 1. 同步参数 (CG)
         log.info("APP", "Step 1: Syncing Config from MCU")
-        proto.am_tx(proto.next_id(), "CMD", "CG", "devID=" .. current_devid)
-        local sync_line = proto.wait_for_uart_line(3000, function(l)
-             return string.find(l, "MA,1") and string.find(l, ",RSP,CG")
-        end)
+        local sync_line = proto.request_mcu(proto.next_id(), "CG", "devID=" .. current_devid, 1500, 3)
         if sync_line then
             local p6 = proto.split_n(sync_line, ",", 6)
             local mcu_map = proto.parse_payload(p6[6])
@@ -164,7 +173,8 @@ local function timer_task()
             log.info("APP", "Sync Success. ADDR=" .. config.ADDR)
             last_mcu_alive = true
         else
-            log.warn("APP", "Sync Timeout")
+            log.warn("APP", "Sync Failed after retries")
+            -- 如果同步失败，暂时不判定离线，留给 MG 去判定
         end
 
         -- 2. 采集定位 (GPS/LBS)
@@ -179,26 +189,8 @@ local function timer_task()
 
         -- 3. 触发采样 (MG)
         log.info("APP", "Step 3: Triggering MCU Measurement")
-        local mcu_responded = false
-        for retry = 1, 3 do
-            proto.am_tx(proto.next_id(), "CMD", "MG", "devID=" .. current_devid)
-            local end_time = mcu.ticks() + 2000
-            while mcu.ticks() < end_time do
-                local ok, line = sys.waitUntil("UART_RECV", 500)
-                if ok and line then
-                    local p6 = proto.split_n(line, ",", 6)
-                    -- 匹配 MA,1,MID,ACK,MG 或 MA,1,MID,RSP,MG (如果是立刻回复结果的话)
-                    if #p6 >= 5 and p6[1] == "MA" and (p6[4] == "ACK" or p6[4] == "RSP") and p6[5] == "MG" then
-                        mcu_responded = true; break
-                    elseif string.find(line, "^MA,1,") then
-                        -- 其他非目标报文重新分发
-                        sys.publish("UART_RECV", line)
-                    end
-                end
-            end
-            if mcu_responded then break end
-            log.warn("APP", "MCU MG Retry " .. retry)
-        end
+        local mg_resp = proto.request_mcu(proto.next_id(), "MG", "devID=" .. current_devid, 1500, 3)
+        local mcu_responded = (mg_resp ~= nil)
 
         if not mcu_responded then
             log.error("APP", "MCU Offline confirmed after 3 retries")
@@ -208,6 +200,8 @@ local function timer_task()
         else
             last_mcu_alive = true
         end
+
+        mcu_is_busy = false
     end
 end
 
