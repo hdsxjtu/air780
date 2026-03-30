@@ -36,20 +36,20 @@ local function handle_sa_command(sock, frame)
     if frame.type ~= "CMD" then return end
     local payload_map = proto.parse_payload(frame.payload)
     
-    -- 1. 模组忙阻判定 (同步未完成或正在进行业务)
     local current_devid = "DEV" .. (config.ADDR or "0")
+    
+    -- 1. 严格 ID 校验 (前置防线：ID不对或没带ID，直接明确 ack=2 拒绝)
+    if not payload_map.devID or payload_map.devID ~= current_devid then
+        log.error("APP", "ID Mismatch or Missing: expected " .. current_devid .. " but got " .. tostring(payload_map.devID))
+        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_ID_MISMATCH) 
+        return 
+    end
+
+    -- 2. 模组忙阻判定 (同步未完成或正在进行业务)
     if not boot_synced or mcu_is_busy then
         log.warn("APP", "System Startup/Busy, rejecting SA command: " .. (frame.id or "N/A"))
         proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_BUSY)
         return
-    end
-
-    -- 2. 严格 ID 校验 (基准：config.ADDR)
-    local current_devid = "DEV" .. (config.ADDR or "0")
-    if payload_map.devID and payload_map.devID ~= current_devid then
-        log.error("APP", "ID Mismatch: expected " .. current_devid .. " but got " .. payload_map.devID)
-        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";ack=" .. proto.ACK_ID_MISMATCH) 
-        return 
     end
 
     -- 3. 针对 CG/CS 指令的处理
