@@ -12,11 +12,11 @@ config.SERVER_PORT     = 520       -- << 修改这里：服务器 UDP 端口
 
 -- Project Info
 config.PROJECT         = "TRACKER_PRO"
-config.VERSION         = "2.0.0"
+config.VERSION         = "1.0.0"
 
 -- Hardware Definitions
 config.LED_PIN         = 27 -- GPIO 27 (NetStatus)
-config.UART_ID         = 15 -- 主 UART
+config.UART_ID         = 1 -- 主 UART
 config.UART_BAUD       = 9600 -- 9600波特率可唤醒MCU的LPUART Stop模式
 
 -- Power Management
@@ -25,7 +25,7 @@ config.UART_BAUD       = 9600 -- 9600波特率可唤醒MCU的LPUART Stop模式
 config.POWER_MODE      = 1 -- Light Sleep：保持网络在线，服务器可随时下发命令
 
 -- Timing Configuration
-config.HEARTBEAT_INTERVAL = 2 * 60 * 1000 -- 【轻量】心跳周期间隔 (ms)，仅维持 UDP 映射，建议 2 分钟。固定值，与 RPT_INT 无关。
+config.HEARTBEAT_INTERVAL = 5 * 60 * 1000 -- 【轻量】心跳周期间隔 (ms)，仅维持 UDP 映射，建议 5 分钟。固定值，与 RPT_INT 无关。
 config.REPORT_INTERVAL    = 60 * 60 * 1000 -- 【重量】定时采样间隔 (ms)，唤醒 MCU 采气。对应协议中的 RPT_INT 参数，单位：分钟（此处默认 60m）。
 config.LBS_TIMEOUT        = 30000          -- LBS 定位超时
 

@@ -4,36 +4,25 @@ local led = require("usr_led")
 local lbs = require("usr_lbs")
 local uart = require("usr_uart")
 
+-- ========================================================================
+-- 核心架构说明 (Architecture Overview):
+-- 1. 本程序采用“多任务并发”架构，通过 sys.taskInit 启动四个并行的任务人。
+-- 2. 任务之间通过 sys.publish (发信号) 和 sys.waitUntil (等信号) 进行沟通。
+-- 3. 所有的 sys.wait (休眠) 都会触发硬件底层的自动降功耗，实现“快心跳、慢采样”。
+-- ========================================================================
+
 local app = {}
-local netc = nil
-local next_msg_id = 3334
-local last_mcu_alive = true
-local imei = ""
+local netc = nil            -- 全局网络连接句柄 (UDP Socket)
+local next_msg_id = 3334    -- mid 计数器 (3334-6666 用于模组主动心跳)
+local last_mcu_alive = true -- 记录单片机是否正常（心跳用）
+local imei = ""             -- 设备唯一标识 (devID)，启动后会与单片机自动同步
+local uart_locked = false   -- UART 串口资源互斥锁
 
--- 建立短码与长参数名的映射表（用于协议解析）
-local LONG_TO_SHORT = {
-    REPORT_INTERVAL = "RPT_INT",
-    ALARM_BARO_A_LOW = "PRA_L",
-    ALARM_BARO_A_HIGH = "PRA_H",
-    ALARM_BARO_B_LOW = "PRB_L",
-    ALARM_BARO_B_HIGH = "PRB_H",
-    ALARM_METHANE_LOW = "CH4_L",
-    ALARM_METHANE_HIGH = "CH4_H",
-    ALARM_TEMPERATURE_LOW = "TMP_L",
-    ALARM_TEMPERATURE_HIGH = "TMP_H",
-    ALARM_BATTERY_LOW = "BAT_L",
-}
+-- 协议 ACK 状态码定义 (§3.7)
+local ACK_OFFLINE     = "0" -- 单片机未响应或忙碌
+local ACK_SUCCESS     = "1" -- 指令执行成功/已受理
+local ACK_ID_MISMATCH = "2" -- 设备 ID 不匹配，拒绝执行
 
-local SHORT_TO_LONG = {}
-for long_name, short_name in pairs(LONG_TO_SHORT) do
-    SHORT_TO_LONG[short_name] = long_name
-end
-
--- 全量参数排序（用于返回 CFG_ALL）
-local PARAM_ORDER = {
-    "RPT_INT", "PRA_L", "PRA_H", "PRB_L", "PRB_H",
-    "CH4_L", "CH4_H", "TMP_L", "TMP_H", "BAT_L",
-}
 
 -- Utility functions
 -- 辅助函数：按分隔符拆分字符串
@@ -101,10 +90,6 @@ local function as_tx(sock, mid, frame_type, cmd, payload)
     end
 end
 
--- 构建测量上报 (MR) 的载荷部分
-local function mr_payload(mcu_line)
-    return "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";" .. mcu_line
-end
 
 -- 构建模组状态 (MD) 的载荷部分
 local function modem_payload(mcu_alive)
@@ -127,115 +112,104 @@ local function parse_sa_frame(data)
     return nil
 end
 
--- 等待串口数据返回特定格式的行（超时退出）
+-- ========================================================================
+-- 核心工具：串口收发与同步 (UART Utilities)
+-- ========================================================================
+
+-- [[ 核心逻辑：等待串口回复 ]]
+-- 逻辑：向单片机发指令后，任务会在这里“睡觉”等待，直到串口有符合 matcher 的行返回或超时。
 local function wait_for_uart_line(timeout_ms, matcher)
     local end_time = mcu.ticks() + timeout_ms
     while mcu.ticks() < end_time do
+        -- 这里是“睡觉”点：sys.waitUntil 会让出 CPU，直到串口驱动发出 "UART_RECV" 信号
         local ok, line = sys.waitUntil("UART_RECV", 500)
         if ok and line and matcher(line) then
             return line
         end
     end
-    return nil
-end
-
-local function wait_for_ack(timeout_ms)
-    return wait_for_uart_line(timeout_ms, function(line)
-        return line == "ACK:0"
-    end)
-end
-
--- 从串口收集配置参数：支持旧的 CONFIG: 格式和新的 MA RSP 格式
-local function collect_config_params(timeout_ms)
-    local values = {}
-    local end_time = mcu.ticks() + timeout_ms
-    while mcu.ticks() < end_time do
-        local ok, line = sys.waitUntil("UART_RECV", 500)
-        if ok and line then
-            if string.sub(line, 1, 2) == "MA" then
-                -- 处理 V1.1 协议帧: MA,1,mid,RSP,CG,payload
-                local p6 = split_n(line, ",", 6)
-                if #p6 == 6 and p6[5] == "CG" then
-                    local payload_map = parse_payload(p6[6])
-                    -- 如果 payload 包含 params=CFG_ALL，则参数就在这一行
-                    for k, v in pairs(payload_map) do
-                        if k ~= "devID" and k ~= "params" and k ~= "gv" then
-                            values[k] = v
-                        end
-                    end
-                    -- 如果是单行全量返回，直接结束
-                    if string.find(p6[6], "params=CFG_ALL") then break end
-                end
-            elseif string.sub(line, 1, 7) == "CONFIG:" then
-                -- 兼容旧的 CONFIG:key,value 格式
-                local body = string.sub(line, 8)
-                if body == "END" then break end
-                local kv = split(body, ",")
-                local short_name = LONG_TO_SHORT[kv[1]] or kv[1]
-                if short_name and kv[2] then values[short_name] = kv[2] end
-            elseif line == "ACK:0" then
-                -- 忽略通用应答
-            elseif string.sub(line, 1, 4) == "ERR:" then
-                return nil
-            end
-        end
-    end
-    local result = {}
-    for _, key in ipairs(PARAM_ORDER) do
-        if values[key] then table.insert(result, key .. "=" .. values[key]) end
-    end
-    return #result > 0 and table.concat(result, ",") or nil
-end
-
-local function find_set_param(payload_map)
-    for key, value in pairs(payload_map) do
-        if key ~= "devID" and key ~= "gv" and key ~= "ack" and key ~= "params" then
-            return key, value
-        end
-    end
-    return nil, nil
+    return nil -- 超时未等到
 end
 
 -- 向 MCU 发送 AM 帧
 -- 协议 §3.4：MCU 可能处于休眠状态，必须先发 0x00 唤醒字节，
 -- 等待 10ms 使 MCU 完成唤醒，再发送正式帧内容。
+-- [[ 核心逻辑：带资源保护的串口发送 ]]
+-- 协议 §3.4：MCU 可能处于休眠状态，必须先发 0x00 唤醒字节，并等待 10ms。
+-- 此处增加了信号驱动锁，防止多个任务同时操作串口导致字节交织冲突。
 local function am_tx(mid, frame_type, cmd, payload)
+    -- 1. 锁等待：如果串口正在被占，就阻塞等待解锁信号
+    while uart_locked do
+        sys.waitUntil("UART_UNLOCK", 500)
+    end
+    
+    -- 2. 上锁
+    uart_locked = true
+    
+    -- 3. 发送序列
     local message = build_frame("AM", mid, frame_type, cmd, payload)
     uart.send("\x00")          -- 唤醒字节
-    sys.wait(10)               -- 等待 MCU 就绪
+    sys.wait(10)               -- [挂起点] 等待 MCU 完成唤醒
     uart.send(message .. "\r\n")
     log.info("UART_TX", message)
+    
+    -- 4. 解锁并广播信号
+    uart_locked = false
+    sys.publish("UART_UNLOCK")
 end
 
--- 处理服务器下发的具体命令任务
+-- [[ 业务中枢：处理服务器指令 (SA 帧) ]]
+-- 逻辑：UDP 收到服务器数据后，会调用此函数。它是 4G 模组的“大脑”。
 local function handle_sa_command(sock, frame)
     if frame.type ~= "CMD" then return end
     local payload_map = parse_payload(frame.payload)
-    if payload_map.devID and payload_map.devID ~= imei then return end
+    
+    -- --- 第一步：严格 ID 校验 (拦截器) ---
+    -- 如果服务器发来的 devID 与本设备不符，直接由于 4G 模组拦截，不发给单片机。
+    if payload_map.devID and payload_map.devID ~= imei then
+        log.error("APP", "ID Mismatch: expected " .. imei .. " but got " .. payload_map.devID)
+        as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. imei .. ";ack=" .. ACK_ID_MISMATCH) 
+        return 
+    end
 
+    -- --- 第二步：针对 CG/CS 指令的处理 ---
     if frame.cmd == "CG" or frame.cmd == "CS" then
-        -- 捕捉 RPT_INT 指令并同步更新 4G 模组自身的定时频率
+        -- 如果是写配置 (CS)，模组先检查 RPT_INT，如果是改采样周期，本地也要同步。
         if frame.cmd == "CS" then
             if payload_map.RPT_INT then
                 config.REPORT_INTERVAL = tonumber(payload_map.RPT_INT) * 60 * 1000
                 log.info("APP", "Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
-            elseif payload_map.REPORT_INTERVAL then
-                config.REPORT_INTERVAL = tonumber(payload_map.REPORT_INTERVAL) * 60 * 1000
-                log.info("APP", "Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
             end
         end
 
-        -- 设置/查询：透传服务器单号给单片机（单片机也会存一份副本）
+        -- --- 第三步：转发给单片机与其交互 ---
+        -- 调用 am_tx 发送。注意：am_tx 内部会自动执行 0x00 唤醒逻辑。
         am_tx(frame.id, "CMD", frame.cmd, frame.payload)
+        
+        -- 在这里睡觉等待单片机的确认响应 (MA 帧)
         local ack_line = wait_for_uart_line(3000, function(l)
+            -- 匹配特定的指令 ID 和命令类型 (匹配 MA,1,ID,RSP,CMD)
             return string.find(l, "MA,1," .. frame.id) and string.find(l, ",RSP," .. frame.cmd)
         end)
         
         if ack_line then
+            -- 拿到了单片机的回复，解析数据
             local p6 = split_n(ack_line, ",", 6)
-            as_tx(sock, frame.id, "RSP", frame.cmd, p6[6] or "")
+            local mcu_payload = p6[6] or ""
+            local mcu_map = parse_payload(mcu_payload)
+            
+            -- 自同步逻辑：从单片机的回复里拉取最新的 RPT_INT 和 devID 以防 4G 模组丢配置。
+            if mcu_map.RPT_INT then
+                config.REPORT_INTERVAL = tonumber(mcu_map.RPT_INT) * 60 * 1000
+            end
+            if mcu_map.devID then
+                imei = mcu_map.devID
+            end
+            
+            -- 将单片机给出的答案返回给服务器
+            as_tx(sock, frame.id, "RSP", frame.cmd, mcu_payload)
         else
-            as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=0")
+            -- 单片机没理你，回复服务器：ack=0 (单片机离线)
+            as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=" .. ACK_OFFLINE)
         end
     elseif frame.cmd == "MS" or frame.cmd == "MG" then
         -- 采样命令：透传服务器单号，不再盲目回 ACK
@@ -256,12 +230,12 @@ local function handle_sa_command(sock, frame)
             as_tx(sock, frame.id, mcu_type, frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=" .. mcu_ack)
             
             -- 只有当 MCU 明确回复 ACK(ack=1) 时，才建立 PENDING_SERVER_MID 关联，等待后续 MR
-            if mcu_type == "ACK" and mcu_ack == "1" then
+            if mcu_type == "ACK" and mcu_ack == ACK_SUCCESS then
                 sys.publish("PENDING_SERVER_MID", frame.id)
             end
         else
             -- 串口超时无应答，向上位机回复拒绝执行
-            as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=0")
+            as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";ack=" .. ACK_OFFLINE)
         end
     elseif frame.cmd == "MD" then
         -- 链路查询命令
@@ -269,9 +243,12 @@ local function handle_sa_command(sock, frame)
     end
 end
 
--- Task 1: Persistent Network Connection and Downlink Listener
--- 任务一：持久网络连接及下行监听任务
--- 负责建立 UDP 长连接，维持在线状态，处理服务器发来的数据
+-- ========================================================================
+-- 四大并行独立任务 (Parallel Tasks Context)
+-- ========================================================================
+
+-- [[ 任务 1：核心网络任务 ]]
+-- 负责 UDP 链路的建立、重连和服务器下行数据的监听分配。
 local function network_task()
     while true do
         if socket.localIP() == "0.0.0.0" or socket.localIP() == nil then
@@ -295,6 +272,15 @@ local function network_task()
                 elseif event == socket.EVENT_CLOSE then
                     sys.publish("SOCKET_CLOSED")
                 end
+            end)
+            
+            -- 联网成功后，立即向单片机发起一次 CG 链路查询，同步初始配置值（如 RPT_INT）
+            sys.taskInit(function()
+                sys.wait(2000) -- 等待网络稳定
+                log.info("APP", "Startup Sync: Querying MCU for config")
+                local sync_mid = next_id()
+                am_tx(sync_mid, "CMD", "CG", "devID=" .. imei)
+                -- 这里通过已注册的 UART 监听自动处理返回，不需要重复等待
             end)
         else
             -- PC 模拟器兼容：启动后台轮询任务拉取下行数据
@@ -369,8 +355,8 @@ local function timer_task()
     end
 end
 
--- Task 2.5: Lightweight Link Maintenance (Heartbeat, Low Power)
--- 任务 2.5：链路维持心跳（仅 4G 发包，不唤醒单片机，频率建议 2 分钟）
+-- Task 3: Lightweight Link Maintenance (Heartbeat, Low Power)
+-- 任务 3：链路维持心跳（仅 4G 发包，不唤醒单片机，频率建议 2 分钟）
 local function heartbeat_task()
     while true do
         sys.wait(config.HEARTBEAT_INTERVAL)
@@ -384,7 +370,7 @@ local function heartbeat_task()
     end
 end
 
--- 任务三：串口监听任务 (负责转发所有从单片机主动或被动发回的数据)
+-- 任务 4：串口监听任务 (负责转发所有从单片机主动或被动发回的数据)
 local function uart_task()
     while true do
         local result, line = sys.waitUntil("UART_RECV", 30000)
@@ -410,15 +396,14 @@ local function uart_task()
                         as_tx(netc, mcu_mid, mcu_type, "MR", updated_payload)
                         
                         -- 根据协议，MR 需要 4G 回应 ACK
-                        uart.send("AM,1," .. mcu_mid .. ",ACK,MR,devID=" .. imei .. ";ack=1\r\n")
+                        -- 此单次发送也受锁保护，防止截断正在进行的 am_tx 指令
+                        while uart_locked do sys.waitUntil("UART_UNLOCK", 100) end
+                        uart_locked = true
+                        uart.send("AM,1," .. mcu_mid .. ",ACK,MR,devID=" .. imei .. ";ack=" .. ACK_SUCCESS .. "\r\n")
+                        uart_locked = false
+                        sys.publish("UART_UNLOCK")
                     end
                 end
-            elseif string.find(line, "^MCU:") then
-                -- 兼容 V1.0 旧协议
-                last_mcu_alive = true
-                as_tx(netc, next_id(), "EVT", "MR", mr_payload(line))
-                local mid_mcu = string.match(line, "mid=(%d+)") or "0000"
-                uart.send("AM,1," .. mid_mcu .. ",ACK,MR,devID=" .. imei .. ";ack=1\r\n")
             end
         end
     end
