@@ -185,7 +185,7 @@ local function timer_task()
     
     mcu_is_busy = true
     for i = 1, 20 do
-        log.info("APP", "Syncing Config Attempt " .. i .. "/20")
+        log.info("APP", ">>> [BOOT_SYNC] Attempt #" .. i .. " / 20 - Requesting CG <<<")
         local current_devid = "DEV" .. (config.ADDR or "0")
         local sync_line = proto.request_mcu(proto.next_id(), "CG", "devID=" .. current_devid, 1000, 1)
         
@@ -206,8 +206,9 @@ local function timer_task()
 
     if not last_mcu_ready then
         log.error("APP", "Initial Sync FAILED after 20 tries - Using default config")
-        -- 这里不再重复发送离线状态，因为紧接着第二阶段就会跑一次带 LBS 定位的完整检测，
-        -- 如果单片机依然离线，下面会把带着经纬度的完美离线状态打包发过去。
+    else
+        -- 初始握手成功，发包后立即释放 RRC 节省开机功耗
+        if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
     end
 
     -- 第二阶段：正常周期循环 (开机立即执行一次 MG)
@@ -232,7 +233,10 @@ local function timer_task()
         if not last_mcu_alive then
             log.error("APP", "MCU Offline confirmed")
             proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, false, last_lat, last_lng))
+            if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
         end
+        -- 注意：如果单片机在线，它随后会通过串口主动上报 MR 帧，
+        -- 届时 uart_task 会负责转发 MR 并执行 rrcRelease，此处只需静候。
 
         mcu_is_busy = false
         
@@ -242,18 +246,21 @@ local function timer_task()
     end
 end
 
--- [[ 任务 3：链路维持心跳 ]]
+-- [[ 任务 3：链路维持心跳 (仅 NAT 触碰，极致续航) ]]
 local function heartbeat_task()
     -- 心跳也要等待首次握手结果，否则发出的 devID 可能是错的
     sys.waitUntil("BOOT_SYNC_DONE")
     
     while true do
-        sys.wait(config.HEARTBEAT_INTERVAL)
+        sys.wait(config.NAT_INTERVAL)
         if netc then
-            local current_devid = "DEV" .. (config.ADDR or "0")
-            -- 回归标准协议心跳（不带经纬度以省电），确保在工具中“看得见”
-            log.info("TRACE", "---- SECRECY HEARTBEAT SENDING NOW ----")
-            proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, last_mcu_alive, nil, nil))
+            -- 仅发送极简字符进行 NAT 触碰，不产生协议干扰
+            socket.tx(netc, " ") 
+            
+            -- 发送完数据后立即请求释放 RRC 连接，回到浅休眠状态
+            if mobile and mobile.rrcRelease then
+                mobile.rrcRelease(true)
+            end
         end
     end
 end
@@ -271,6 +278,7 @@ local function uart_task()
                     if mcu_cmd == "MR" then
                         local updated_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. config.VERSION .. ";")
                         proto.as_tx(netc, mcu_mid, mcu_type, "MR", updated_payload)
+                        if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
                         -- ACK 直接调用协议统一下发 (内置 0x00 唤醒及保护)
                         local real_devid = "DEV" .. (config.ADDR or "0")
