@@ -1,10 +1,7 @@
--- main.lua
--- Entry Point
-
 -- Global Project Info
 -- Note: Must be defined as literals for LuatTools to recognize them
 PROJECT = "TRACKER_PRO"
-VERSION = "2.0.0"
+VERSION = "1.0.0"
 
 local sys = require("sys")
 local config = require("usr_config")
@@ -14,7 +11,7 @@ local app = require("usr_app")
 -- 初始化功耗管理
 -- 启动延时，防止模块在极端情况下启动即休眠导致无法维护
 sys.taskInit(function()
-    sys.wait(3000) 
+    sys.wait(1000) 
     log.info("MAIN", "System Started")
     
     -- 设置模块为 Light Sleep 模式已移至 usr_app.lua

@@ -20,6 +20,10 @@ local mcu_is_busy = false    -- 业务锁：记录当前模组是否正占用串
 local boot_synced = false    -- 握手标志：开机由于系统响应解锁
 local last_mcu_ready = false -- 记录开机握手是否真正成功
 
+-- [[ 新增：指令队列机制，防止丢包 ]]
+local sa_cmd_queue = {}
+local last_processed_mid = ""
+
 -- [[ 内部逻辑：静默刷新 GPS 缓存 ]]
 local function update_gps_cache()
     sys.taskInit(function()
@@ -38,13 +42,20 @@ local function handle_sa_command(sock, frame)
     
     local current_devid = "DEV" .. (config.ADDR or "0")
     
+    -- 0. 重复指令判定 (如果是极速重试的同一个 MID，直接跳过处理，防止重复请求单片机)
+    if frame.id == last_processed_mid then
+        log.warn("APP", "Duplicate MID detected, skipping processing: " .. frame.id)
+        return
+    end
+    last_processed_mid = frame.id
+
     -- 1. 严格 ID 校验 (前置防线：ID不对或没带ID，直接明确 ack=2 拒绝)
     if not payload_map.devID or payload_map.devID ~= current_devid then
         log.error("APP", "ID Mismatch or Missing: expected " .. current_devid .. " but got " .. tostring(payload_map.devID))
         proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_ID_MISMATCH) 
         return 
     end
-
+    
     -- 2. 模组忙阻判定 (同步未完成或正在进行业务)
     if not boot_synced or mcu_is_busy then
         log.warn("APP", "System Startup/Busy, rejecting SA command: " .. (frame.id or "N/A"))
@@ -137,7 +148,9 @@ local function network_task()
                     if type(data) == "string" and #data > 0 then
                         local frame = proto.parse_sa_frame(data)
                         if frame then 
-                            sys.publish("SA_FRAME_RX", frame) -- 解耦：推送到独立协程处理
+                            -- 放入处理队列，防止异步处理导致丢包
+                            table.insert(sa_cmd_queue, frame)
+                            sys.publish("SA_QUEUE_READY") 
                         else
                             log.error("UDP_RX", "Parse failed. Not a valid SA frame.")
                         end
@@ -269,12 +282,18 @@ local function uart_task()
     end
 end
 
--- [[ 任务 5：下发指令处理任务 (协程解耦) ]]
+-- [[ 任务 5：下发指令处理任务 (协程解耦 + 队列化防止丢帧) ]]
 local function sa_command_task()
     while true do
-        local result, frame = sys.waitUntil("SA_FRAME_RX")
-        if result and frame and netc then
-            handle_sa_command(netc, frame)
+        if #sa_cmd_queue == 0 then
+            sys.waitUntil("SA_QUEUE_READY")
+        end
+        
+        while #sa_cmd_queue > 0 do
+            local frame = table.remove(sa_cmd_queue, 1)
+            if frame and netc then
+                handle_sa_command(netc, frame)
+            end
         end
     end
 end
@@ -282,7 +301,9 @@ end
 function app.start()
     led.init(); uart.init()
     if config.POWER_MODE > 0 then
-        pm.request(pm.LIGHT) -- 恢复为您最熟悉的 PM 库底座控制
+        -- 使用 pm.power 设置工作模式为 1 (Light Sleep) 或 2 (Auto-Idle)
+        pm.power(pm.WORK_MODE, config.POWER_MODE)
+        log.info("PM", "Work Mode set to: " .. config.POWER_MODE)
     end
     uart.onReceive(function(line) sys.publish("UART_RECV", line) end)
     sys.taskInit(network_task); sys.taskInit(heartbeat_task)

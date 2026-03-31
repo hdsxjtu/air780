@@ -113,12 +113,9 @@ function proto.wait_for_uart_line(timeout_ms, matcher)
         if ok and line then
             if matcher(line) then
                 return line
-            else
-                -- 如果收到了 MA 开头的帧但不是当前请求等待的，重新发布，防止丢包
-                if string.find(line, "^MA,1,") then
-                    sys.publish("UART_RECV", line)
-                end
             end
+            -- 注意：不再此处 sys.publish，防止死循环！
+            -- 未处理的消息应由专门的单目异步任务 (uart_task) 统一捞取并分发到队列。
         end
     end
     return nil
