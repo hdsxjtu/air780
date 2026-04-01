@@ -38,25 +38,26 @@ end
 -- [[ 业务中枢：处理服务器指令 (SA 帧) ]]
 local function handle_sa_command(sock, frame)
     if frame.type ~= "CMD" then return end
+    
     local payload_map = proto.parse_payload(frame.payload)
     
-    local current_devid = "DEV" .. (config.ADDR or "0")
-    
-    -- 0. 重复指令判定 (如果是极速重试的同一个 MID，直接跳过处理，防止重复请求单片机)
+    local current_devid = config.DEVICE_ID or ("DEV" .. (config.ADDR or "1"))
+
+    -- 0. 重复指令判定
     if frame.id == last_processed_mid then
-        log.warn("APP", "Duplicate MID detected, skipping processing: " .. frame.id)
+        log.warn("APP", "Duplicate MID detected, skipping: " .. frame.id)
         return
     end
     last_processed_mid = frame.id
 
-    -- 1. 严格 ID 校验 (前置防线：ID不对或没带ID，直接明确 ack=2 拒绝)
+    -- 1. 严格 ID 校验 
     if not payload_map.devID or payload_map.devID ~= current_devid then
-        log.error("APP", "ID Mismatch or Missing: expected " .. current_devid .. " but got " .. tostring(payload_map.devID))
+        log.error("APP", "ID Mismatch: expected " .. current_devid .. " but got " .. tostring(payload_map.devID))
         proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_ID_MISMATCH) 
         return 
     end
     
-    -- 2. 模组忙阻判定 (同步未完成或正在进行业务)
+    -- 2. 模组忙阻判定
     if not boot_synced or mcu_is_busy then
         log.warn("APP", "System Startup/Busy, rejecting SA command: " .. (frame.id or "N/A"))
         proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_BUSY)
@@ -78,7 +79,8 @@ local function handle_sa_command(sock, frame)
             end
         end
 
-        local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 1500, 3)
+        local retry_count = (frame.cmd == "CG" or frame.cmd == "CS") and 1 or 3
+        local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 700, retry_count)
         
         if resp_line then
             local p6 = proto.split_n(resp_line, ",", 6)
@@ -92,7 +94,7 @@ local function handle_sa_command(sock, frame)
 
     -- 3. 针对 MS/MG 指令的处理 (二阶段 ACK)
     elseif frame.cmd == "MS" or frame.cmd == "MG" then
-        local first_resp = proto.request_mcu(frame.id, frame.cmd, "devID=" .. current_devid, 1500, 3)
+        local first_resp = proto.request_mcu(frame.id, frame.cmd, "devID=" .. current_devid, 700, 3)
         
         if first_resp then
             local p6 = proto.split_n(first_resp, ",", 6)
@@ -111,7 +113,7 @@ local function handle_sa_command(sock, frame)
             proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. config.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
         end
     elseif frame.cmd == "MD" then
-        update_gps_cache() -- 仅在查状态时触发静默刷新
+        update_gps_cache() 
         proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, last_lat, last_lng))
     end
     mcu_is_busy = false
@@ -136,27 +138,21 @@ local function network_task()
             -- 注意：demo 中使用的是 socket.EVENT (或者是具体的 RX 常量)
             -- 只要有事件进来，由于是无连接的 UDP，大概率是收到了数据
             if event == socket.EVENT or event == socket.EVENT_RX or event == socket.EVENT_RECV then
-                -- 在调用底层 rx 之前，强制将游标复位到 0！
-                -- 因为 clear() 在某些旧固件中仅仅清空内容但不移动游标，导致第二包追加到了第一包后面
-                rxbuff:seek(0, 0) 
-                
-                local ok, len = socket.rx(sc, rxbuff)
-                if ok and len and len > 0 then
-                    local data = rxbuff:toStr(0, len)
-                    log.info("UDP_RX", "Len: " .. tostring(len) .. " Data: " .. tostring(data))
-                    
-                    if type(data) == "string" and #data > 0 then
+                -- 必须循环读取，直到读空，防止 UDP 缓冲区堆积导致丢包 (关键加固)
+                while true do
+                    rxbuff:seek(0, 0)
+                    local ok, len = socket.rx(sc, rxbuff)
+                    if ok and len and len > 0 then
+                        local data = rxbuff:toStr(0, len)
+                        log.info("UDP_RX", "Drained Packet: " .. data)
                         local frame = proto.parse_sa_frame(data)
-                        if frame then 
-                            -- 放入处理队列，防止异步处理导致丢包
+                        if frame then
                             table.insert(sa_cmd_queue, frame)
-                            sys.publish("SA_QUEUE_READY") 
-                        else
-                            log.error("UDP_RX", "Parse failed. Not a valid SA frame.")
+                            sys.publish("SA_QUEUE_READY")
                         end
+                    else
+                        break
                     end
-                else
-                    log.warn("UDP_RX", "socket.rx returned failure")
                 end
             elseif event == socket.EVENT_CLOSE then
                 log.error("UDP_EVENT", "Socket closed by remote or network!")
@@ -186,16 +182,28 @@ local function timer_task()
     mcu_is_busy = true
     for i = 1, 20 do
         log.info("APP", ">>> [BOOT_SYNC] Attempt #" .. i .. " / 20 - Requesting CG <<<")
-        local current_devid = "DEV" .. (config.ADDR or "0")
-        local sync_line = proto.request_mcu(proto.next_id(), "CG", "devID=" .. current_devid, 1000, 1)
+        local current_devid = config.DEVICE_ID or ("DEV" .. (config.ADDR or "1"))
+        local sync_line = proto.request_mcu(proto.next_id(), "CG", "devID=" .. current_devid, 700, 1)
         
         if sync_line then
             local p6 = proto.split_n(sync_line, ",", 6)
             local mcu_map = proto.parse_payload(p6[6])
-            if mcu_map.ADDR then config.ADDR = tonumber(mcu_map.ADDR) end
+            
+            -- 单片机的 ADDR 仅用于物理区分
+            if mcu_map.ADDR then 
+                config.ADDR = tonumber(mcu_map.ADDR) 
+            elseif mcu_map.devID then
+                -- 【动态认主】如果在应答头里发现它叫 DEV1014，直接认领
+                local grabbed_addr = string.match(mcu_map.devID, "DEV(%d+)")
+                if grabbed_addr then config.ADDR = tonumber(grabbed_addr) end
+            end
+            
             if mcu_map.RPT_INT then config.REPORT_INTERVAL = tonumber(mcu_map.RPT_INT) * 60 * 1000 end
-            log.info("APP", "Initial Sync SUCCESS. Correct ADDR=" .. config.ADDR)
+            
+            local current_devid = "DEV" .. (config.ADDR or "1")
+            log.info("APP", "Initial Sync Handshake hit. Active ID=" .. current_devid)
             last_mcu_ready = true
+            sys.publish("BOOT_SYNC_DONE")
             break
         end
         sys.wait(1000)
@@ -227,7 +235,8 @@ local function timer_task()
 
         -- 3. 触发采样 (MG)
         log.info("APP", "Triggering MCU Measurement")
-        local mg_resp = proto.request_mcu(proto.next_id(), "MG", "devID=" .. current_devid, 1500, 3)
+        local current_devid = config.DEVICE_ID or ("DEV" .. (config.ADDR or "1"))
+        local mg_resp = proto.request_mcu(proto.next_id(), "MG", "devID=" .. current_devid, 700, 3)
         last_mcu_alive = (mg_resp ~= nil)
 
         if not last_mcu_alive then
@@ -254,8 +263,9 @@ local function heartbeat_task()
     while true do
         sys.wait(config.NAT_INTERVAL)
         if netc then
-            -- 仅发送极简字符进行 NAT 触碰，不产生协议干扰
-            socket.tx(netc, " ") 
+            -- 升级为“极简身份脉冲”，让服务器在 NAT 漂移时也能秒级锁定 ID
+            local current_devid = config.DEVICE_ID or ("DEV" .. (config.ADDR or "1"))
+            socket.tx(netc, "devID=" .. current_devid .. ";HB") 
             
             -- 发送完数据后立即请求释放 RRC 连接，回到浅休眠状态
             if mobile and mobile.rrcRelease then
@@ -275,14 +285,19 @@ local function uart_task()
                 if #p6 == 6 then
                     local mcu_mid, mcu_type, mcu_cmd, mcu_payload = p6[3], p6[4], p6[5], p6[6]
                     last_mcu_alive = true
+                    
+                    -- 【动态认主】截获单片机主动吐出的 ID（例如 DEV1014）并纠正自己的认知
+                    local learned_addr = string.match(mcu_payload, "devID=DEV(%d+)")
+                    if learned_addr then config.ADDR = tonumber(learned_addr) end
+                    
                     if mcu_cmd == "MR" then
-                        local updated_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. config.VERSION .. ";")
-                        proto.as_tx(netc, mcu_mid, mcu_type, "MR", updated_payload)
+                        local current_devid = config.DEVICE_ID or ("DEV" .. (config.ADDR or "1"))
+                        local final_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. config.VERSION .. ";")
+                        
+                        proto.as_tx(netc, mcu_mid, mcu_type, "MR", final_payload)
                         if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
-                        -- ACK 直接调用协议统一下发 (内置 0x00 唤醒及保护)
-                        local real_devid = "DEV" .. (config.ADDR or "0")
-                        proto.am_tx(mcu_mid, "ACK", "MR", "devID=" .. real_devid .. ";ack=" .. proto.ACK_SUCCESS)
+                        proto.am_tx(mcu_mid, "ACK", "MR", "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS)
                     end
                 end
             end
