@@ -74,7 +74,12 @@ end
 -- 向服务器发送 AS 帧
 function proto.as_tx(sock, mid, frame_type, cmd, payload)
     if sock then
-        local message = proto.build_frame("AS", mid, frame_type, cmd, payload)
+        local imei = mobile and mobile.imei and mobile.imei() or ""
+        local appended_payload = payload
+        if imei ~= "" and not string.find(payload or "", "imei=") then
+            appended_payload = (payload or "") .. ";imei=" .. imei
+        end
+        local message = proto.build_frame("AS", mid, frame_type, cmd, appended_payload)
         socket.tx(sock, message)
         log.info("UDP_TX", message)
     end
@@ -87,7 +92,7 @@ function proto.modem_payload(imei, mcu_alive, lat, lng)
         rsrp = mobile.rsrp()
     end
     local mdead = mcu_alive and "0" or "1"
-    local payload = "devID=" .. imei .. ";gv=4G" .. config.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
+    local payload = "devID=" .. imei .. ";gv=4G" .. _G.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
     if lat and lng then
         payload = payload .. ";lat=" .. lat .. ";lng=" .. lng
     end
