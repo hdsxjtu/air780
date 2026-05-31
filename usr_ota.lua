@@ -1,18 +1,23 @@
-local sys = require("sys")
+local sys   = require("sys")
 local proto = require("usr_protocol")
-local ota = {}
+local ota   = {}
 
--- 1. Pure-Lua standard CRC32 (polynomial 0xEDB88320)
+-- ============================================================
+-- 本地固件文件路径 & 大小限制
+-- ============================================================
+local MCU_FW_PATH    = "/mcu_fw.bin"
+local MCU_FW_MAX_SIZE = 110 * 1024   -- 110 KB (运行区上限)
+
+-- ============================================================
+-- 内部工具: CRC32 (polynomial 0xEDB88320)
+-- ============================================================
 local function crc32_file(filepath)
     local f = io.open(filepath, "rb")
     if not f then return nil end
     local crc = 0xFFFFFFFF
-    local chunk_size = 1024
-    
     while true do
-        local bytes = f:read(chunk_size)
+        local bytes = f:read(1024)
         if not bytes or #bytes == 0 then break end
-        
         for i = 1, #bytes do
             local b = string.byte(bytes, i)
             crc = bit.bxor(crc, b)
@@ -29,7 +34,7 @@ local function crc32_file(filepath)
     return bit.bnot(crc)
 end
 
--- 2. Hex encoder helper
+-- 内部工具: 字节串转16进制字符串
 local function to_hex(str)
     local hex = {}
     for i = 1, #str do
@@ -38,133 +43,187 @@ local function to_hex(str)
     return table.concat(hex)
 end
 
--- 3. 启动 4G 模组 OTA 升级
-function ota.start(url)
+-- ============================================================
+-- 命令 1: FD — Firmware Download (强制下载)
+-- 从服务器 HTTP 下载固件到本地 /mcu_fw.bin
+-- 只操作4G模组本地存储，完全不接触单片机
+--
+-- 成功: publish("FOTA_STATE", "fd_ok",   文件大小)
+-- 失败: publish("FOTA_STATE", "fd_error_xxx", 错误码)
+-- ============================================================
+function ota.download(url)
     if not url or url == "" then
-        log.error("OTA", "Empty URL provided for OTA")
+        log.error("OTA:FD", "Empty URL")
+        sys.publish("FOTA_STATE", "fd_error_empty_url", -1)
         return false
     end
-    
-    log.info("OTA", "Starting direct HTTP FOTA from: " .. url)
-    
-    local code, headers, body = http.request("GET", url, nil, nil, {fota = true}).wait()
-    log.info("OTA", "FOTA HTTP Response Code: " .. tostring(code))
-    
-    local status_name = "unknown"
-    if code == 200 then
-        status_name = "success"
-        log.info("OTA", "Upgrade package downloaded successfully. Rebooting in 3s...")
-        sys.timerStart(function()
-            log.info("OTA", "System Rebooting for OTA update...")
-            rtos.reboot()
-        end, 3000)
-    else
-        status_name = "error_download_" .. tostring(code)
-        log.error("OTA", "FOTA Failed: HTTP download error " .. tostring(code))
+
+    log.info("OTA:FD", "Downloading: " .. url)
+
+    -- 删除旧文件，防止下载失败时保留残留
+    pcall(os.remove, MCU_FW_PATH)
+
+    -- 流式写入本地文件系统，防止内存溢出
+    local code = http.request("GET", url, nil, nil, {dst = MCU_FW_PATH}).wait()
+    log.info("OTA:FD", "HTTP result: " .. tostring(code))
+
+    if code ~= 200 then
+        log.error("OTA:FD", "Download FAILED. HTTP code: " .. tostring(code))
+        pcall(os.remove, MCU_FW_PATH)
+        sys.publish("FOTA_STATE", "fd_error_http", code)
+        return false
     end
 
-    sys.publish("FOTA_STATE", status_name, code)
+    -- 校验文件大小
+    local fsize = lfs.fileSize(MCU_FW_PATH)
+    if not fsize or fsize == 0 or fsize > MCU_FW_MAX_SIZE then
+        log.error("OTA:FD", "Invalid file size: " .. tostring(fsize))
+        pcall(os.remove, MCU_FW_PATH)
+        sys.publish("FOTA_STATE", "fd_error_size", fsize or 0)
+        return false
+    end
+
+    -- 计算并验证 CRC32
+    local crc = crc32_file(MCU_FW_PATH)
+    if not crc then
+        log.error("OTA:FD", "CRC32 calculation failed")
+        pcall(os.remove, MCU_FW_PATH)
+        sys.publish("FOTA_STATE", "fd_error_crc", 0)
+        return false
+    end
+
+    log.info("OTA:FD", string.format("Download OK. Size=%d bytes, CRC32=%u", fsize, crc))
+    sys.publish("FOTA_STATE", "fd_ok", fsize)
     return true
 end
 
--- 4. 启动单片机 (MCU) IAP 升级
-function ota.start_mcu(url)
-    if not url or url == "" then
-        log.error("OTA", "Empty MCU URL provided")
-        sys.publish("FOTA_STATE", "error_mcu_empty_url", -1)
+-- ============================================================
+-- 命令 2: FU — Firmware Upgrade (强制升级)
+-- 使用本地已存储的 /mcu_fw.bin 对单片机执行 IAP 刷写
+-- 前提：单片机已处于 BOOT 救砖模式（由外部保证）
+-- 传输失败时自动发 RESET，使单片机回到救砖状态供下次重试
+--
+-- 成功: publish("FOTA_STATE", "fu_ok",   0)
+-- 失败: publish("FOTA_STATE", "fu_error_xxx", 错误信息)
+-- ============================================================
+function ota.flash()
+    -- 检查本地固件文件是否存在且有效
+    local fsize = lfs.fileSize(MCU_FW_PATH)
+    if not fsize or fsize == 0 or fsize > MCU_FW_MAX_SIZE then
+        log.error("OTA:FU", "No valid firmware at " .. MCU_FW_PATH .. " (size=" .. tostring(fsize) .. ")")
+        sys.publish("FOTA_STATE", "fu_error_no_file", 0)
         return false
     end
-    
-    local file_path = "/mcu_fw.bin"
-    log.info("OTA", "Downloading MCU binary from: " .. url)
-    
-    -- 使用 dst 属性直接将包流式保存到本地 flash 文件系统，防止内存溢出
-    local code, headers, body = http.request("GET", url, nil, nil, {dst = file_path}).wait()
-    log.info("OTA", "MCU download result code: " .. tostring(code))
-    
-    if code ~= 200 then
-        log.error("OTA", "MCU download FAILED. Code: " .. tostring(code))
-        sys.publish("FOTA_STATE", "error_mcu_download", code)
-        return false
-    end
-    
-    -- 获取文件大小
-    local file_size = lfs.fileSize(file_path)
-    if not file_size or file_size == 0 or file_size > (110 * 1024) then
-        log.error("OTA", "Invalid MCU file size: " .. tostring(file_size))
-        sys.publish("FOTA_STATE", "error_mcu_size", file_size)
-        return false
-    end
-    
-    -- 计算 CRC32
-    local file_crc = crc32_file(file_path)
+
+    -- 重新校验 CRC（防止文件在存储期间损坏）
+    local file_crc = crc32_file(MCU_FW_PATH)
     if not file_crc then
-        log.error("OTA", "MCU CRC32 calculation failed")
-        sys.publish("FOTA_STATE", "error_mcu_crc", 0)
+        log.error("OTA:FU", "CRC32 failed on local file")
+        sys.publish("FOTA_STATE", "fu_error_crc", 0)
         return false
     end
-    
-    log.info("OTA", string.format("MCU FW verified. Size: %d bytes, CRC32: %u. Starting UART flashing...", file_size, file_crc))
-    
-    -- (1) 发送 OU (Start) 指令给单片机
+
+    log.info("OTA:FU", string.format("Starting flash. Size=%d, CRC32=%u", fsize, file_crc))
+
     local mid = "9999"
-    local init_payload = string.format("size=%d;crc=%u", file_size, file_crc)
-    local resp = proto.request_mcu(mid, "OU", init_payload, 2000, 3)
-    if not resp then
-        log.error("OTA", "MCU rejected IAP initialization (OU Command)")
-        sys.publish("FOTA_STATE", "error_mcu_init_rejected", 0)
+
+    -- ----------------------------------------------------------
+    -- (1) OU: 通知 Boot 准备升级 → Boot 擦除 APP 运行区
+    --     超时 5s，最多重试 3 次
+    -- ----------------------------------------------------------
+    local init_payload = string.format("size=%d;crc=%u", fsize, file_crc)
+    local ou_resp = proto.request_mcu(mid, "OU", init_payload, 5000, 3)
+    if not ou_resp then
+        log.error("OTA:FU", "OU rejected by Boot (MCU not in boot mode?)")
+        sys.publish("FOTA_STATE", "fu_error_ou", 0)
         return false
     end
-    
-    -- (2) 开始分块读取并发送 OD (Data) 指令
-    local f = io.open(file_path, "rb")
+    log.info("OTA:FU", "OU OK — APP run area erased")
+
+    -- ----------------------------------------------------------
+    -- (2) OD: 分块发送固件数据（128字节/块）
+    --     每块超时 2s，失败重试 5 次
+    -- ----------------------------------------------------------
+    local f = io.open(MCU_FW_PATH, "rb")
     if not f then
-        sys.publish("FOTA_STATE", "error_mcu_read_fail", 0)
+        log.error("OTA:FU", "Cannot open " .. MCU_FW_PATH)
+        proto.request_mcu(mid, "RESET", "", 500, 1)  -- 复位，APP区已擦，Boot自然留下
+        sys.publish("FOTA_STATE", "fu_error_open_file", 0)
         return false
     end
-    
+
     local block_idx = 0
-    local chunk_size = 128
-    local success = true
-    
+    local tx_ok = true
+
     while true do
-        local chunk = f:read(chunk_size)
+        local chunk = f:read(128)
         if not chunk or #chunk == 0 then break end
-        
-        local hex_chunk = to_hex(chunk)
-        local data_payload = string.format("block=%d;len=%d;data=%s", block_idx, #chunk, hex_chunk)
-        
-        -- 对每个分包进行带重试的发送，最多重试 5 次，每次 1.5s 响应
-        local data_resp = proto.request_mcu(mid, "OD", data_payload, 1500, 5)
-        if not data_resp then
-            log.error("OTA", "Failed to transmit block " .. block_idx)
-            success = false
+
+        local payload = string.format("block=%d;len=%d;data=%s",
+                                      block_idx, #chunk, to_hex(chunk))
+        local od_resp = proto.request_mcu(mid, "OD", payload, 2000, 5)
+
+        if not od_resp then
+            log.error("OTA:FU", "Block " .. block_idx .. " failed after 5 retries")
+            tx_ok = false
             break
         end
-        
+
         block_idx = block_idx + 1
-        -- 释放 CPU 给系统其他任务喘息
-        sys.wait(10)
+        sys.wait(10)   -- 让出 CPU，防止看门狗超时
     end
     f:close()
-    
-    if not success then
-        sys.publish("FOTA_STATE", "error_mcu_transmission", block_idx)
+
+    if not tx_ok then
+        -- OD 失败 → RESET → Boot 因 APP 区已擦而自动留在救砖模式 → 可重新 FU
+        log.error("OTA:FU", "Transmission failed at block " .. block_idx .. ", sending RESET")
+        proto.request_mcu(mid, "RESET", "", 500, 1)
+        sys.publish("FOTA_STATE", "fu_error_tx", block_idx)
         return false
     end
-    
-    -- (3) 发送 OE (End) 指令，触发 MCU 校验及搬运重启
-    log.info("OTA", "All blocks sent successfully. Sending commit command (OE)...")
-    local end_resp = proto.request_mcu(mid, "OE", "status=commit", 3000, 3)
-    if not end_resp then
-        log.error("OTA", "MCU failed to commit and jump (OE Command)")
-        sys.publish("FOTA_STATE", "error_mcu_commit_failed", 0)
+
+    log.info("OTA:FU", "All " .. block_idx .. " blocks sent. Sending OE...")
+
+    -- ----------------------------------------------------------
+    -- (3) OE: 提交 → Boot 校验 CRC → 直接跳转 APP（不再复位）
+    --     超时 8s（Boot 侧需要做 CRC 计算）
+    -- ----------------------------------------------------------
+    local oe_resp = proto.request_mcu(mid, "OE", "status=commit", 8000, 3)
+    if not oe_resp then
+        log.error("OTA:FU", "OE commit failed, sending RESET")
+        proto.request_mcu(mid, "RESET", "", 500, 1)
+        sys.publish("FOTA_STATE", "fu_error_oe", 0)
         return false
     end
-    
-    log.info("OTA", "MCU Upgrade completed successfully. MCU is now rebooting.")
-    sys.publish("FOTA_STATE", "success", 0)
+
+    log.info("OTA:FU", "MCU upgrade complete! Boot is jumping to APP.")
+    sys.publish("FOTA_STATE", "fu_ok", 0)
     return true
+end
+
+-- ============================================================
+-- 4G 模组自身 FOTA 升级（保留原有功能）
+-- ============================================================
+function ota.start(url)
+    if not url or url == "" then
+        log.error("OTA:4G", "Empty URL")
+        sys.publish("FOTA_STATE", "4g_error_empty_url", -1)
+        return false
+    end
+    log.info("OTA:4G", "Starting 4G FOTA from: " .. url)
+    local code = http.request("GET", url, nil, nil, {fota = true}).wait()
+    log.info("OTA:4G", "FOTA HTTP code: " .. tostring(code))
+    if code == 200 then
+        log.info("OTA:4G", "Downloaded OK, sending status then rebooting...")
+        -- 先发状态给服务器，再等待网络flush，最后重启
+        sys.publish("FOTA_STATE", "4g_ok", code)
+        sys.wait(3000)  -- 等待 UDP 报文发出
+        rtos.reboot()
+    else
+        log.error("OTA:4G", "FOTA failed: " .. tostring(code))
+        sys.publish("FOTA_STATE", "4g_error_http", code)
+    end
+    return code == 200
 end
 
 return ota

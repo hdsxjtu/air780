@@ -25,6 +25,7 @@ local last_mcu_ready = false -- 记录开机握手是否真正成功
 local sa_cmd_queue = {}
 local last_processed_mid = ""
 local last_ota_mid = nil -- 新增：用于记录下发升级指令的 MID，以便异步回调时回传结果
+local last_ota_cmd = nil -- 新增：记录升级指令类型 (FD/FU/OU)，确保回调使用正确的命令名
 
 -- [[ 新增：获取唯一设备 ID (优先使用 config.DEVICE_ID，最后使用 DEV + ADDR) ]]
 local function get_device_id()
@@ -75,8 +76,11 @@ local function handle_sa_command(sock, frame)
         return
     end
 
-    -- 3. 针对 CG/CS 指令的处理
-    mcu_is_busy = true
+    -- 3. 针对需要单片机参与的命令 (CG/CS/MS/MG)：加忙锁
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "MS" or frame.cmd == "MG" then
+        mcu_is_busy = true
+    end
+
     if frame.cmd == "CG" or frame.cmd == "CS" then
         if frame.cmd == "CS" then
             if payload_map.RPT_INT then
@@ -103,7 +107,7 @@ local function handle_sa_command(sock, frame)
             proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
         end
 
-    -- 3. 针对 MS/MG 指令的处理 (二阶段 ACK)
+    -- 针对 MS/MG 指令的处理 (二阶段 ACK)
     elseif frame.cmd == "MS" or frame.cmd == "MG" then
         local first_resp = proto.request_mcu(frame.id, frame.cmd, "devID=" .. current_devid, 700, 3)
         
@@ -126,27 +130,63 @@ local function handle_sa_command(sock, frame)
     elseif frame.cmd == "MD" then
         update_gps_cache() 
         proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, last_lat, last_lng))
-    elseif frame.cmd == "OU" then
+    -- ----------------------------------------------------------------
+    -- FD: Firmware Download — 强制下载固件到4G模组本地，不碰单片机
+    -- 服务端发: SA,1,XXXX,CMD,FD,devID=DEV1;url=http://xxx/fw.bin
+    -- ----------------------------------------------------------------
+    elseif frame.cmd == "FD" then
         if payload_map.url then
-            local target = payload_map.target or "4g"
-            log.info("APP", "Received FOTA request. Target: " .. target .. " URL: " .. tostring(payload_map.url))
-            
-            -- 发送一个初始响应给服务器，告知已受理
-            proto.as_tx(sock, frame.id, "RSP", "OU", "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=downloading")
-            
-            -- 启动异步升级任务
+            log.info("APP", "[FD] URL: " .. payload_map.url)
+            proto.as_tx(sock, frame.id, "RSP", "FD",
+                "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=downloading")
             sys.taskInit(function()
-                last_ota_mid = frame.id -- 记录当前指令 ID
-                sys.wait(1000) -- 给串口/网络一个喘息机会
-                if target == "mcu" then
-                    ota.start_mcu(payload_map.url)
-                else
-                    ota.start(payload_map.url)
-                end
+                last_ota_mid = frame.id
+                last_ota_cmd = "FD"
+                sys.wait(500)
+                local ok = ota.download(payload_map.url)
+                -- 结果由 FOTA_STATE 事件回调上报，此处无需重复
             end)
         else
-            log.warn("APP", "Invalid OU payload: " .. (frame.payload or ""))
-            proto.as_tx(sock, frame.id, "RSP", "OU", "devID=" .. current_devid .. ";ack=" .. proto.ACK_ERROR)
+            log.warn("APP", "[FD] Missing url in payload")
+            proto.as_tx(sock, frame.id, "RSP", "FD",
+                "devID=" .. current_devid .. ";ack=" .. proto.ACK_ERROR .. ";status=missing_url")
+        end
+
+    -- ----------------------------------------------------------------
+    -- FU: Firmware Upgrade — 用本地已下载的固件刷写单片机
+    -- 前提：单片机已处于 BOOT 救砖模式
+    -- 服务端发: SA,1,XXXX,CMD,FU,devID=DEV1
+    -- ----------------------------------------------------------------
+    elseif frame.cmd == "FU" then
+        log.info("APP", "[FU] Starting MCU flash from local firmware")
+        proto.as_tx(sock, frame.id, "RSP", "FU",
+            "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=flashing")
+        sys.taskInit(function()
+            last_ota_mid = frame.id
+            last_ota_cmd = "FU"
+            sys.wait(500)
+            local ok = ota.flash()
+            -- 结果由 FOTA_STATE 事件回调上报
+        end)
+
+    -- ----------------------------------------------------------------
+    -- OU: 4G模组自身FOTA（保留旧功能，target=4g）
+    -- ----------------------------------------------------------------
+    elseif frame.cmd == "OU" then
+        if payload_map.url then
+            log.info("APP", "[OU] 4G FOTA URL: " .. payload_map.url)
+            proto.as_tx(sock, frame.id, "RSP", "OU",
+                "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=downloading")
+            sys.taskInit(function()
+                last_ota_mid = frame.id
+                last_ota_cmd = "OU"
+                sys.wait(500)
+                ota.start(payload_map.url)
+            end)
+        else
+            log.warn("APP", "[OU] Missing url in payload")
+            proto.as_tx(sock, frame.id, "RSP", "OU",
+                "devID=" .. current_devid .. ";ack=" .. proto.ACK_ERROR)
         end
     end
     mcu_is_busy = false
@@ -361,8 +401,9 @@ sys.subscribe("FOTA_STATE", function(status_name, result)
     log.info("APP", "OTA Status Event: " .. status_name)
     if last_ota_mid and netc then
         local current_devid = get_device_id()
-        -- 向服务器回传最终执行结果
-        proto.as_tx(netc, last_ota_mid, "RSP", "OU", "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=" .. status_name)
+        -- 使用原始指令类型 (FD/FU/OU)，而非统一写死 OU
+        local rsp_cmd = last_ota_cmd or "OU"
+        proto.as_tx(netc, last_ota_mid, "RSP", rsp_cmd, "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=" .. status_name)
     end
 end)
 
