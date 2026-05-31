@@ -2,6 +2,15 @@ local sys   = require("sys")
 local proto = require("usr_protocol")
 local ota   = {}
 
+-- 获取文件大小 (标准 io，不依赖 lfs 模块)
+local function file_size(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local size = f:seek("end")
+    f:close()
+    return size
+end
+
 -- ============================================================
 -- 本地固件文件路径 & 大小限制
 -- ============================================================
@@ -15,6 +24,7 @@ local function crc32_file(filepath)
     local f = io.open(filepath, "rb")
     if not f then return nil end
     local crc = 0xFFFFFFFF
+    local chunk_count = 0
     while true do
         local bytes = f:read(1024)
         if not bytes or #bytes == 0 then break end
@@ -29,6 +39,9 @@ local function crc32_file(filepath)
                 end
             end
         end
+        chunk_count = chunk_count + 1
+        -- 每 1KB 让出 CPU 给看门狗（嵌入式Lua CRC很慢，必须高频让步）
+        sys.wait(5)
     end
     f:close()
     return bit.bnot(crc)
@@ -60,12 +73,35 @@ function ota.download(url)
 
     log.info("OTA:FD", "Downloading: " .. url)
 
-    -- 删除旧文件，防止下载失败时保留残留
-    pcall(os.remove, MCU_FW_PATH)
+    -- 诊断：下载前文件系统状态
+    local f_before = io.open(MCU_FW_PATH, "rb")
+    if f_before then
+        local old_size = f_before:seek("end")
+        f_before:close()
+        log.info("OTA:FD", "[DIAG] Old file exists, size=" .. tostring(old_size))
+    else
+        log.info("OTA:FD", "[DIAG] No old file at " .. MCU_FW_PATH)
+    end
 
-    -- 流式写入本地文件系统，防止内存溢出
+    -- 删除旧文件
+    local rm_ok, rm_err = os.remove(MCU_FW_PATH)
+    log.info("OTA:FD", string.format("[DIAG] Remove old: ok=%s err=%s", tostring(rm_ok), tostring(rm_err)))
+
+    -- 流式写入本地文件系统
     local code = http.request("GET", url, nil, nil, {dst = MCU_FW_PATH}).wait()
     log.info("OTA:FD", "HTTP result: " .. tostring(code))
+
+    if code == 200 then
+        -- 诊断：下载后立即检查
+        local f_after = io.open(MCU_FW_PATH, "rb")
+        if f_after then
+            local new_size = f_after:seek("end")
+            f_after:close()
+            log.info("OTA:FD", string.format("[DIAG] File created OK, size=%d bytes", new_size))
+        else
+            log.error("OTA:FD", "[DIAG] File NOT FOUND after download!")
+        end
+    end
 
     if code ~= 200 then
         log.error("OTA:FD", "Download FAILED. HTTP code: " .. tostring(code))
@@ -75,7 +111,7 @@ function ota.download(url)
     end
 
     -- 校验文件大小
-    local fsize = lfs.fileSize(MCU_FW_PATH)
+    local fsize = file_size(MCU_FW_PATH)
     if not fsize or fsize == 0 or fsize > MCU_FW_MAX_SIZE then
         log.error("OTA:FD", "Invalid file size: " .. tostring(fsize))
         pcall(os.remove, MCU_FW_PATH)
@@ -84,7 +120,11 @@ function ota.download(url)
     end
 
     -- 计算并验证 CRC32
+    log.info("OTA:FD", "[DIAG] Starting CRC32, file=" .. tostring(fsize) .. " bytes ...")
+    local crc_start = os.clock()
     local crc = crc32_file(MCU_FW_PATH)
+    local crc_elapsed = os.clock() - crc_start
+    log.info("OTA:FD", string.format("[DIAG] CRC32 done in %.3fs, result=%s", crc_elapsed, tostring(crc)))
     if not crc then
         log.error("OTA:FD", "CRC32 calculation failed")
         pcall(os.remove, MCU_FW_PATH)
@@ -93,14 +133,14 @@ function ota.download(url)
     end
 
     log.info("OTA:FD", string.format("Download OK. Size=%d bytes, CRC32=%u", fsize, crc))
-    sys.publish("FOTA_STATE", "fd_ok", fsize)
+    sys.publish("FOTA_STATE", "fd_ok", {size = fsize, crc = crc})
     return true
 end
 
 -- ============================================================
 -- 命令 2: FU — Firmware Upgrade (强制升级)
 -- 使用本地已存储的 /mcu_fw.bin 对单片机执行 IAP 刷写
--- 前提：单片机已处于 BOOT 救砖模式（由外部保证）
+-- 自动发送 BOOT 命令让 MCU 进入 bootloader，无需手动操作
 -- 传输失败时自动发 RESET，使单片机回到救砖状态供下次重试
 --
 -- 成功: publish("FOTA_STATE", "fu_ok",   0)
@@ -108,7 +148,7 @@ end
 -- ============================================================
 function ota.flash()
     -- 检查本地固件文件是否存在且有效
-    local fsize = lfs.fileSize(MCU_FW_PATH)
+    local fsize = file_size(MCU_FW_PATH)
     if not fsize or fsize == 0 or fsize > MCU_FW_MAX_SIZE then
         log.error("OTA:FU", "No valid firmware at " .. MCU_FW_PATH .. " (size=" .. tostring(fsize) .. ")")
         sys.publish("FOTA_STATE", "fu_error_no_file", 0)
@@ -126,6 +166,22 @@ function ota.flash()
     log.info("OTA:FU", string.format("Starting flash. Size=%d, CRC32=%u", fsize, file_crc))
 
     local mid = "9999"
+
+    -- ----------------------------------------------------------
+    -- (0) 自动进入 BOOT 模式：发送 BOOT 命令给 MCU APP
+    --     APP 收到后写 RTC 魔术字 0xB007B007 → 复位
+    --     Bootloader 启动后检测魔术字 → 留在救砖模式
+    -- ----------------------------------------------------------
+    log.info("OTA:FU", "Sending BOOT to MCU APP (force enter bootloader)...")
+    local boot_resp = proto.request_mcu(mid, "BOOT", "", 700, 3)
+    if not boot_resp then
+        log.error("OTA:FU", "BOOT failed — MCU may be offline")
+        sys.publish("FOTA_STATE", "fu_error_ou", 0)
+        return false
+    end
+    log.info("OTA:FU", "BOOT ACK received, MCU is rebooting into bootloader...")
+    -- 等待 MCU 复位 + Bootloader 初始化 (约 2s)
+    sys.wait(2500)
 
     -- ----------------------------------------------------------
     -- (1) OU: 通知 Boot 准备升级 → Boot 擦除 APP 运行区

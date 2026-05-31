@@ -153,8 +153,8 @@ local function handle_sa_command(sock, frame)
         end
 
     -- ----------------------------------------------------------------
-    -- FU: Firmware Upgrade — 用本地已下载的固件刷写单片机
-    -- 前提：单片机已处于 BOOT 救砖模式
+    -- FU: Firmware Upgrade — 自动让MCU进入BOOT模式后刷写
+    -- 自动发送 BOOT → MCU复位 → Bootloader 救砖模式 → OU/OD/OE
     -- 服务端发: SA,1,XXXX,CMD,FU,devID=DEV1
     -- ----------------------------------------------------------------
     elseif frame.cmd == "FU" then
@@ -398,12 +398,26 @@ end
 
 -- [[ 任务 6：处理 OTA 状态回调 (异步上报给服务器) ]]
 sys.subscribe("FOTA_STATE", function(status_name, result)
-    log.info("APP", "OTA Status Event: " .. status_name)
+    log.info("APP", "OTA Status Event: " .. status_name .. ", result: " .. tostring(result))
     if last_ota_mid and netc then
         local current_devid = get_device_id()
         -- 使用原始指令类型 (FD/FU/OU)，而非统一写死 OU
         local rsp_cmd = last_ota_cmd or "OU"
-        proto.as_tx(netc, last_ota_mid, "RSP", rsp_cmd, "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=" .. status_name)
+        local payload = "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=" .. status_name
+        if status_name == "fd_ok" and type(result) == "table" then
+            -- CRC 转 uint32 十六进制显示 (兼容负数)
+            local crc_u32 = result.crc
+            if crc_u32 < 0 then crc_u32 = crc_u32 + 0x100000000 end
+            payload = payload .. ";size=" .. tostring(result.size) .. ";crc=0x" .. string.format("%08X", crc_u32)
+        elseif status_name == "fd_ok" and type(result) == "number" then
+            -- 兼容旧版 (只发CRC数字)
+            local crc_u32 = result
+            if crc_u32 < 0 then crc_u32 = crc_u32 + 0x100000000 end
+            payload = payload .. ";crc=0x" .. string.format("%08X", crc_u32)
+        elseif result then
+            payload = payload .. ";val=" .. tostring(result)
+        end
+        proto.as_tx(netc, last_ota_mid, "RSP", rsp_cmd, payload)
     end
 end)
 
