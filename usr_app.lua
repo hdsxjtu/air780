@@ -62,9 +62,9 @@ local function handle_sa_command(sock, frame)
     end
     last_processed_mid = frame.id
 
-    -- 1. 严格 ID 校验和 IMEI 校验 
+    -- 1. 严格 ID 校验和 IMEI 校验 (强制要求指令必须携带 IMEI 且完全匹配，防重名风险)
     local local_imei = mobile and mobile.imei and mobile.imei() or ""
-    if not payload_map.devID or payload_map.devID ~= current_devid or (payload_map.imei and payload_map.imei ~= local_imei) then
+    if not payload_map.devID or payload_map.devID ~= current_devid or not payload_map.imei or payload_map.imei ~= local_imei then
         log.error("APP", "ID/IMEI Mismatch: expected " .. current_devid .. "/" .. local_imei .. " but got " .. tostring(payload_map.devID) .. "/" .. tostring(payload_map.imei))
         proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_ID_MISMATCH) 
         return 
