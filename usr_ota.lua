@@ -168,20 +168,30 @@ function ota.flash()
     local mid = "9999"
 
     -- ----------------------------------------------------------
-    -- (0) 自动进入 BOOT 模式：发送 BOOT 命令给 MCU APP
-    --     APP 收到后写 RTC 魔术字 0xB007B007 → 复位
-    --     Bootloader 启动后检测魔术字 → 留在救砖模式
+    -- (0) 自动进入 BOOT 模式：发送 RESET 命令给 MCU APP
+    --     APP 收到后回复并系统复位，进入 Bootloader
     -- ----------------------------------------------------------
-    log.info("OTA:FU", "Sending BOOT to MCU APP (force enter bootloader)...")
-    local boot_resp = proto.request_mcu(mid, "BOOT", "", 700, 3)
+    log.info("OTA:FU", "Sending RESET to MCU APP (force reboot into bootloader)...")
+    local boot_resp = proto.request_mcu(mid, "RESET", "", 700, 3)
     if not boot_resp then
         log.error("OTA:FU", "BOOT failed — MCU may be offline")
         sys.publish("FOTA_STATE", "fu_error_ou", 0)
         return false
     end
     log.info("OTA:FU", "BOOT ACK received, MCU is rebooting into bootloader...")
-    -- 等待 MCU 复位 + Bootloader 初始化 (约 2s)
-    sys.wait(2500)
+    -- 等待 MCU 复位并启动 Bootloader (约 500ms)
+    sys.wait(500)
+
+    -- 再次向 Bootloader 发送 BOOT 命令，使其锁定在救砖模式（防止 Boot 1秒超时跳回 APP）
+    log.info("OTA:FU", "Sending BOOT to Bootloader to hold it in rescue mode...")
+    local hold_resp = proto.request_mcu(mid, "BOOT", "", 700, 5)
+    if not hold_resp then
+        log.error("OTA:FU", "Failed to hold Bootloader in rescue mode")
+        sys.publish("FOTA_STATE", "fu_error_ou", 0)
+        return false
+    end
+    log.info("OTA:FU", "Bootloader is successfully locked in rescue mode. Preparing OU...")
+    sys.wait(100)
 
     -- ----------------------------------------------------------
     -- (1) OU: 通知 Boot 准备升级 → Boot 擦除 APP 运行区
@@ -241,7 +251,7 @@ function ota.flash()
     log.info("OTA:FU", "All " .. block_idx .. " blocks sent. Sending OE...")
 
     -- ----------------------------------------------------------
-    -- (3) OE: 提交 → Boot 校验 CRC → 直接跳转 APP（不再复位）
+    -- (3) OE: 提交 → Boot 校验 CRC 并等待 4G 的 RESET 指令来复位系统
     --     超时 8s（Boot 侧需要做 CRC 计算）
     -- ----------------------------------------------------------
     local oe_resp = proto.request_mcu(mid, "OE", "status=commit", 8000, 3)
@@ -252,7 +262,14 @@ function ota.flash()
         return false
     end
 
-    log.info("OTA:FU", "MCU upgrade complete! Boot is jumping to APP.")
+    -- 升级成功，按用户设计：由 4G 模组发起 RESET 指令让单片机复位
+    log.info("OTA:FU", "MCU upgrade complete! Sending RESET to reboot MCU...")
+    sys.wait(100)
+    local reset_resp = proto.request_mcu(mid, "RESET", "", 500, 3)
+    if not reset_resp then
+        log.warn("OTA:FU", "RESET ACK missing, but MCU should be rebooting...")
+    end
+
     sys.publish("FOTA_STATE", "fu_ok", 0)
     return true
 end
