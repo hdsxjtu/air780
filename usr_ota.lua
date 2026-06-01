@@ -146,7 +146,7 @@ end
 -- 成功: publish("FOTA_STATE", "fu_ok",   0)
 -- 失败: publish("FOTA_STATE", "fu_error_xxx", 错误信息)
 -- ============================================================
-function ota.flash()
+function ota.flash(crc)
     -- 检查本地固件文件是否存在且有效
     local fsize = file_size(MCU_FW_PATH)
     if not fsize or fsize == 0 or fsize > MCU_FW_MAX_SIZE then
@@ -154,15 +154,20 @@ function ota.flash()
         sys.publish("FOTA_STATE", "fu_error_no_file", 0)
         return false
     end
+ 
+    -- 优先使用传入的 CRC，若未传入则从本地文件重新计算（兜底兼容）
+    local file_crc = crc
+    if not file_crc then
+        log.warn("OTA:FU", "No CRC passed, calculating from local file...")
+        file_crc = crc32_file(MCU_FW_PATH)
+    end
 
-    -- 重新校验 CRC（防止文件在存储期间损坏）
-    local file_crc = crc32_file(MCU_FW_PATH)
     if not file_crc then
         log.error("OTA:FU", "CRC32 failed on local file")
         sys.publish("FOTA_STATE", "fu_error_crc", 0)
         return false
     end
-
+ 
     log.info("OTA:FU", string.format("Starting flash. Size=%d, CRC32=%u", fsize, file_crc))
 
     local mid = "9999"
