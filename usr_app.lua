@@ -26,6 +26,7 @@ local sa_cmd_queue = {}
 local last_processed_mid = ""
 local last_ota_mid = nil -- 新增：用于记录下发升级指令的 MID，以便异步回调时回传结果
 local last_ota_cmd = nil -- 新增：记录升级指令类型 (FD/FU/OU)，确保回调使用正确的命令名
+local last_mcu_fw_crc = nil -- 新增：用于缓存已下载固件的 CRC，以便刷写时免除重复计算
 
 -- [[ 新增：获取唯一设备 ID (优先使用 config.DEVICE_ID，最后使用 DEV + ADDR) ]]
 local function get_device_id()
@@ -165,7 +166,7 @@ local function handle_sa_command(sock, frame)
             last_ota_mid = frame.id
             last_ota_cmd = "FU"
             sys.wait(500)
-            local ok = ota.flash()
+            local ok = ota.flash(last_mcu_fw_crc)
             -- 结果由 FOTA_STATE 事件回调上报
         end)
 
@@ -399,6 +400,14 @@ end
 -- [[ 任务 6：处理 OTA 状态回调 (异步上报给服务器) ]]
 sys.subscribe("FOTA_STATE", function(status_name, result)
     log.info("APP", "OTA Status Event: " .. status_name .. ", result: " .. tostring(result))
+    if status_name == "fd_ok" then
+        if type(result) == "table" then
+            last_mcu_fw_crc = result.crc
+        else
+            last_mcu_fw_crc = result
+        end
+    end
+
     if last_ota_mid and netc then
         local current_devid = get_device_id()
         -- 使用原始指令类型 (FD/FU/OU)，而非统一写死 OU
