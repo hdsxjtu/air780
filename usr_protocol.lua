@@ -5,6 +5,25 @@ local uart = require("usr_uart")
 
 local proto = {}
 
+-- 全局网络句柄与追踪状态函数，用于将串口收发追踪静默回传给服务器，方便在无串口LOG环境定位丢包问题
+local debug_sock = nil
+function proto.set_debug_socket(sock)
+    debug_sock = sock
+end
+
+function proto.trace_to_server(action, cmd, data)
+    if debug_sock then
+        -- 静默异步发送调试报文，前缀为 EVT，命令为 DEBUG
+        sys.taskInit(function()
+            local clean_data = string.gsub(data or "", "[\r\n]", "")
+            if string.len(clean_data) > 100 then
+                clean_data = string.sub(clean_data, 1, 100) .. "..."
+            end
+            proto.as_tx(debug_sock, "9999", "EVT", "DEBUG", "action=" .. action .. ";cmd=" .. (cmd or "N/A") .. ";msg=" .. clean_data)
+        end)
+    end
+end
+
 -- 协议 ACK 状态码定义 (§3.7)
 proto.ACK_BUSY        = "0" -- 单片机测气中或串口占用 (建议重试)
 proto.ACK_SUCCESS     = "1" -- 指令执行成功/已受理
@@ -141,11 +160,14 @@ function proto.request_mcu(mid, cmd, payload, timeout_ms, retries)
         end)
         
         if resp then
+            proto.trace_to_server("RX", cmd, resp)
             return resp -- 成功拿到应答，直接返回
         end
+        proto.trace_to_server("TIMEOUT", cmd, "Attempt " .. i .. " failed")
         log.warn("PROTO", "MCU Request Timeout: " .. cmd .. " (Attempt " .. i .. " failed)")
     end
     
+    proto.trace_to_server("FAILED", cmd, "After " .. max_retries .. " retries")
     log.error("PROTO", "MCU Request Failed: " .. cmd .. " after " .. max_retries .. " retries")
     return nil -- 三次全失败
 end
@@ -164,6 +186,7 @@ function proto.am_tx(mid, frame_type, cmd, payload)
     local message = proto.build_frame("AM", mid, frame_type, cmd, payload)
     uart.send(message .. "\r\n")
     log.info("UART_TX", message)
+    proto.trace_to_server("TX", cmd, message)
     
     uart_locked = false
     sys.publish("UART_UNLOCK")

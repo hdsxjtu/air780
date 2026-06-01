@@ -77,12 +77,12 @@ local function handle_sa_command(sock, frame)
         return
     end
 
-    -- 3. 针对需要单片机参与的命令 (CG/CS/MS/MG)：加忙锁
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "MS" or frame.cmd == "MG" then
+    -- 3. 针对需要单片机参与的命令 (CG/CS/MS/MG/RESET/BOOT)：加忙锁
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         mcu_is_busy = true
     end
 
-    if frame.cmd == "CG" or frame.cmd == "CS" then
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         if frame.cmd == "CS" then
             if payload_map.RPT_INT then
                 config.REPORT_INTERVAL = tonumber(payload_map.RPT_INT) * 60 * 1000
@@ -95,8 +95,8 @@ local function handle_sa_command(sock, frame)
             end
         end
 
-        local retry_count = (frame.cmd == "CG" or frame.cmd == "CS") and 1 or 3
-        local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 700, retry_count)
+        local retry_count = (frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT") and 1 or 3
+        local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 1500, retry_count)
         
         if resp_line then
             local p6 = proto.split_n(resp_line, ",", 6)
@@ -110,7 +110,7 @@ local function handle_sa_command(sock, frame)
 
     -- 针对 MS/MG 指令的处理 (二阶段 ACK)
     elseif frame.cmd == "MS" or frame.cmd == "MG" then
-        local first_resp = proto.request_mcu(frame.id, frame.cmd, "devID=" .. current_devid, 700, 3)
+        local first_resp = proto.request_mcu(frame.id, frame.cmd, "devID=" .. current_devid, 1500, 3)
         
         if first_resp then
             local p6 = proto.split_n(first_resp, ",", 6)
@@ -238,11 +238,13 @@ local function network_task()
 
         if socket.connect(netc, config.SERVER_IP, config.SERVER_PORT) then
             -- 成功连接服务器
+            proto.set_debug_socket(netc)
             sys.publish("SOCKET_CONNECTED")
             sys.waitUntil("SOCKET_CLOSED", 86400000)
         else
             sys.wait(5000)
         end
+        proto.set_debug_socket(nil)
         if netc then socket.close(netc) netc = nil end
     end
 end
@@ -257,7 +259,7 @@ local function timer_task()
     for i = 1, 20 do
         log.info("APP", ">>> [BOOT_SYNC] Attempt #" .. i .. " / 20 - Requesting CG <<<")
         local current_devid = get_device_id()
-        local sync_line = proto.request_mcu(proto.next_id(), "CG", "devID=" .. current_devid, 700, 1)
+        local sync_line = proto.request_mcu(proto.next_id(), "CG", "devID=" .. current_devid, 1500, 1)
         
         if sync_line then
             local p6 = proto.split_n(sync_line, ",", 6)

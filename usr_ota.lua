@@ -47,6 +47,34 @@ local function crc32_file(filepath)
     return bit.bnot(crc)
 end
 
+-- 持久化固件信息
+local INFO_FILE_PATH = "/mcu_fw_info.json"
+function ota.save_info(size, crc)
+    local f = io.open(INFO_FILE_PATH, "w")
+    if f then
+        f:write(string.format('{"size":%d,"crc":%u}', size, crc))
+        f:close()
+        log.info("OTA", "Saved firmware metadata: size=" .. size .. ", crc=" .. crc)
+        return true
+    end
+    return false
+end
+
+function ota.load_info()
+    local f = io.open(INFO_FILE_PATH, "r")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    if content then
+        local size = string.match(content, '"size":(%d+)')
+        local crc = string.match(content, '"crc":(%d+)')
+        if size and crc then
+            return {size = tonumber(size), crc = tonumber(crc)}
+        end
+    end
+    return nil
+end
+
 -- 内部工具: 字节串转16进制字符串
 local function to_hex(str)
     local hex = {}
@@ -133,6 +161,7 @@ function ota.download(url)
     end
 
     log.info("OTA:FD", string.format("Download OK. Size=%d bytes, CRC32=%u", fsize, crc))
+    ota.save_info(fsize, crc)
     sys.publish("FOTA_STATE", "fd_ok", {size = fsize, crc = crc})
     return true
 end
@@ -155,11 +184,17 @@ function ota.flash(crc)
         return false
     end
  
-    -- 优先使用传入的 CRC，若未传入则从本地文件重新计算（兜底兼容）
+    -- 优先使用传入的 CRC，若未传入则尝试从本地文件载入（避免重复慢计算）
     local file_crc = crc
     if not file_crc then
-        log.warn("OTA:FU", "No CRC passed, calculating from local file...")
-        file_crc = crc32_file(MCU_FW_PATH)
+        local saved = ota.load_info()
+        if saved and saved.size == fsize then
+            file_crc = saved.crc
+            log.info("OTA:FU", "Loaded CRC from storage: " .. tostring(file_crc))
+        else
+            log.warn("OTA:FU", "No saved CRC matched, calculating from local file...")
+            file_crc = crc32_file(MCU_FW_PATH)
+        end
     end
 
     if not file_crc then
