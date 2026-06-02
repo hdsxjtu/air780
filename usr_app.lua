@@ -331,7 +331,7 @@ local function timer_task()
     end
 end
 
--- [[ 任务 3：链路维持心跳 (仅 NAT 触碰，极致续航) ]]
+-- [[ 任务 3：链路维持心跳 (极致续航) ]]
 local function heartbeat_task()
     -- 心跳也要等待首次握手结果，否则发出的 devID 可能是错的
     sys.waitUntil("BOOT_SYNC_DONE")
@@ -339,11 +339,9 @@ local function heartbeat_task()
     while true do
         sys.wait(config.NAT_INTERVAL)
         if netc then
-            -- 升级为“极简身份脉冲”，让服务器在 NAT 漂移时也能秒级锁定 ID
+            -- 升级为标准 AS 协议帧心跳，确保全链路报文格式统一
             local current_devid = get_device_id()
-            local imei = mobile and mobile.imei and mobile.imei() or ""
-            local imei_part = imei ~= "" and (";imei=" .. imei) or ""
-            socket.tx(netc, "devID=" .. current_devid .. ";HB" .. imei_part) 
+            proto.as_tx(netc, proto.next_id(), "EVT", "HB", "devID=" .. current_devid .. ";HB")
             
             -- 发送完数据后立即请求释放 RRC 连接，回到浅休眠状态
             if mobile and mobile.rrcRelease then
