@@ -28,4 +28,44 @@ config.REPORT_INTERVAL    = 60 * 60 * 1000 -- 【重量】定时采样间隔 (ms
 config.ADDR               = 1              -- 【配置】设备物理地址（site_id），与单片机同步。
 config.LBS_TIMEOUT        = 30000          -- LBS 定位超时
 
+local CONFIG_FILE = "/usr_config.json"
+
+function config.save()
+    local f = io.open(CONFIG_FILE, "w")
+    if f then
+        f:write(string.format('{"ADDR":%d,"REPORT_INTERVAL":%d}', 
+            config.ADDR or 1, config.REPORT_INTERVAL or (60 * 60 * 1000)))
+        f:close()
+        log.info("CONFIG", "Saved local config: ADDR=" .. tostring(config.ADDR) .. ", RPT_INT=" .. tostring(config.REPORT_INTERVAL))
+        return true
+    end
+    return false
+end
+
+function config.load()
+    local f = io.open(CONFIG_FILE, "r")
+    if not f then 
+        log.info("CONFIG", "No saved config found, using defaults")
+        return false 
+    end
+    local content = f:read("*a")
+    f:close()
+    if content then
+        local addr = string.match(content, '"ADDR":(%d+)')
+        local rpt = string.match(content, '"REPORT_INTERVAL":(%d+)')
+        if addr then
+            config.ADDR = tonumber(addr)
+        end
+        if rpt then
+            config.REPORT_INTERVAL = tonumber(rpt)
+        end
+        log.info("CONFIG", "Loaded saved config: ADDR=" .. tostring(config.ADDR) .. ", RPT_INT=" .. tostring(config.REPORT_INTERVAL))
+        return true
+    end
+    return false
+end
+
+-- 自动恢复配置
+config.load()
+
 return config

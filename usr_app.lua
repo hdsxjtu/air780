@@ -84,14 +84,20 @@ local function handle_sa_command(sock, frame)
 
     if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         if frame.cmd == "CS" then
+            local modified = false
             if payload_map.RPT_INT then
                 config.REPORT_INTERVAL = tonumber(payload_map.RPT_INT) * 60 * 1000
                 log.info("APP", "Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
+                modified = true
             end
             if payload_map.ADDR then
                 config.ADDR = tonumber(payload_map.ADDR)
                 log.info("APP", "Local ADDR updated to " .. config.ADDR)
                 -- 地址更新后，后续回复将自动使用新 ID
+                modified = true
+            end
+            if modified then
+                config.save()
             end
         end
 
@@ -269,16 +275,28 @@ local function timer_task()
             local p6 = proto.split_n(sync_line, ",", 6)
             local mcu_map = proto.parse_payload(p6[6])
             
+            local modified = false
             -- 单片机的 ADDR 仅用于物理区分
             if mcu_map.ADDR then 
                 config.ADDR = tonumber(mcu_map.ADDR) 
+                modified = true
             elseif mcu_map.devID then
                 -- 【动态认主】如果在应答头里发现它叫 DEV1014，直接认领
                 local grabbed_addr = string.match(mcu_map.devID, "DEV(%d+)")
-                if grabbed_addr then config.ADDR = tonumber(grabbed_addr) end
+                if grabbed_addr then 
+                    config.ADDR = tonumber(grabbed_addr) 
+                    modified = true
+                end
             end
             
-            if mcu_map.RPT_INT then config.REPORT_INTERVAL = tonumber(mcu_map.RPT_INT) * 60 * 1000 end
+            if mcu_map.RPT_INT then 
+                config.REPORT_INTERVAL = tonumber(mcu_map.RPT_INT) * 60 * 1000 
+                modified = true
+            end
+
+            if modified then
+                config.save()
+            end
             
             local current_devid = get_device_id()
             log.info("APP", "Initial Sync Handshake hit. Active ID=" .. current_devid)
@@ -368,7 +386,13 @@ local function uart_task()
                     
                     -- 【动态认主】截获单片机主动吐出的 ID（例如 DEV1014）并纠正自己的认知
                     local learned_addr = string.match(mcu_payload, "devID=DEV(%d+)")
-                    if learned_addr then config.ADDR = tonumber(learned_addr) end
+                    if learned_addr then 
+                        local learned = tonumber(learned_addr)
+                        if config.ADDR ~= learned then
+                            config.ADDR = learned
+                            config.save()
+                        end
+                    end
                     
                     if mcu_cmd == "MR" then
                         local current_devid = get_device_id()
