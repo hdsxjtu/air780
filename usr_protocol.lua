@@ -4,6 +4,7 @@ local mobile = _G.mobile
 local uart = require("usr_uart")
 
 local proto = {}
+proto.last_tx_time = 0
 
 -- 全局网络句柄与追踪状态函数，用于将串口收发追踪静默回传给服务器，方便在无串口LOG环境定位丢包问题
 local debug_sock = nil
@@ -101,6 +102,7 @@ function proto.as_tx(sock, mid, frame_type, cmd, payload)
         local message = proto.build_frame("AS", mid, frame_type, cmd, appended_payload)
         socket.tx(sock, message)
         log.info("UDP_TX", message)
+        proto.last_tx_time = os.time()
     end
 end
 

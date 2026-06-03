@@ -368,15 +368,21 @@ local function heartbeat_task()
     sys.waitUntil("BOOT_SYNC_DONE")
     
     while true do
-        sys.wait(config.NAT_INTERVAL)
+        sys.wait(1000) -- 每 1 秒检查一次
         if netc then
-            -- 升级为标准 AS 协议帧心跳，确保全链路报文格式统一
-            local current_devid = get_device_id()
-            proto.as_tx(netc, proto.next_id(), "EVT", "HB", "devID=" .. current_devid .. ";HB")
+            local now = os.time()
+            local elapsed = now - (proto.last_tx_time or 0)
+            local interval = (config.NAT_INTERVAL and config.NAT_INTERVAL > 0) and (config.NAT_INTERVAL / 1000) or 30
             
-            -- 发送完数据后立即请求释放 RRC 连接，回到浅休眠状态
-            if mobile and mobile.rrcRelease then
-                mobile.rrcRelease(true)
+            if elapsed >= interval then
+                -- 升级为标准 AS 协议帧心跳，确保全链路报文格式统一
+                local current_devid = get_device_id()
+                proto.as_tx(netc, proto.next_id(), "EVT", "HB", "devID=" .. current_devid .. ";HB")
+                
+                -- 发送完数据后立即请求释放 RRC 连接，回到浅休眠状态
+                if mobile and mobile.rrcRelease then
+                    mobile.rrcRelease(true)
+                end
             end
         end
     end

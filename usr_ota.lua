@@ -195,7 +195,7 @@ function ota.flash(crc)
 
     -- 再次向 Bootloader 发送 BOOT 命令，使其锁定在救砖模式（防止 Boot 1秒超时跳回 APP）
     log.info("OTA:FU", "Sending BOOT to Bootloader to hold it in rescue mode...")
-    local hold_resp = proto.request_mcu(mid, "BOOT", "", 700, 1)
+    local hold_resp = proto.request_mcu(mid, "BOOT", "", 1000, 3)
     if not hold_resp then
         log.error("OTA:FU", "Failed to hold Bootloader in rescue mode")
         sys.publish("FOTA_STATE", "fu_error_ou", 0)
