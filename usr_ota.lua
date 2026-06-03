@@ -20,32 +20,26 @@ local MCU_FW_MAX_SIZE = 214 * 1024   -- 214 KB (运行区上限，对应 Pages 1
 -- ============================================================
 -- 内部工具: CRC32 (polynomial 0xEDB88320)
 -- ============================================================
+local crc32_table = nil
+
 local function crc32_file(filepath)
     local f = io.open(filepath, "rb")
     if not f then return nil end
+
     local crc = 0xFFFFFFFF
-    local chunk_count = 0
     while true do
-        local bytes = f:read(1024)
-        if not bytes or #bytes == 0 then break end
-        for i = 1, #bytes do
-            local b = string.byte(bytes, i)
-            crc = bit.bxor(crc, b)
-            for j = 1, 8 do
-                if bit.band(crc, 1) ~= 0 then
-                    crc = bit.bxor(bit.rshift(crc, 1), 0xEDB88320)
-                else
-                    crc = bit.rshift(crc, 1)
-                end
-            end
-        end
-        chunk_count = chunk_count + 1
-        -- 每 1KB 让出 CPU 给看门狗（嵌入式Lua CRC很慢，必须高频让步）
-        sys.wait(5)
+        local chunk = f:read(4096)
+        if not chunk or #chunk == 0 then break end
+        crc = crypto.crc32(chunk, crc, 0x04C11DB7, 0)
     end
     f:close()
-    return bit.bnot(crc)
+    
+    local final_crc = bit.bxor(crc, 0xFFFFFFFF)
+    if final_crc < 0 then final_crc = final_crc + 0x100000000 end
+    return final_crc
 end
+
+
 
 -- 持久化固件信息
 local INFO_FILE_PATH = "/mcu_fw_info.json"
@@ -212,7 +206,7 @@ function ota.flash(crc)
     --     APP 收到后回复并系统复位，进入 Bootloader
     -- ----------------------------------------------------------
     log.info("OTA:FU", "Sending RESET to MCU APP (force reboot into bootloader)...")
-    local boot_resp = proto.request_mcu(mid, "RESET", "", 700, 3)
+    local boot_resp = proto.request_mcu(mid, "RESET", "", 700, 1)
     if not boot_resp then
         log.error("OTA:FU", "BOOT failed — MCU may be offline")
         sys.publish("FOTA_STATE", "fu_error_ou", 0)
@@ -224,7 +218,7 @@ function ota.flash(crc)
 
     -- 再次向 Bootloader 发送 BOOT 命令，使其锁定在救砖模式（防止 Boot 1秒超时跳回 APP）
     log.info("OTA:FU", "Sending BOOT to Bootloader to hold it in rescue mode...")
-    local hold_resp = proto.request_mcu(mid, "BOOT", "", 700, 5)
+    local hold_resp = proto.request_mcu(mid, "BOOT", "", 700, 1)
     if not hold_resp then
         log.error("OTA:FU", "Failed to hold Bootloader in rescue mode")
         sys.publish("FOTA_STATE", "fu_error_ou", 0)

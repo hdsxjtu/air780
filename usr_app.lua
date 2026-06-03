@@ -102,7 +102,11 @@ local function handle_sa_command(sock, frame)
             local p6 = proto.split_n(resp_line, ",", 6)
             local mcu_payload = p6[6] or ""
             last_mcu_alive = true
-            proto.as_tx(sock, frame.id, "RSP", frame.cmd, mcu_payload)
+            local final_payload = mcu_payload
+            if frame.cmd == "CG" or frame.cmd == "CS" then
+                final_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. _G.VERSION .. ";")
+            end
+            proto.as_tx(sock, frame.id, "RSP", frame.cmd, final_payload)
         else
             last_mcu_alive = false
             proto.as_tx(sock, frame.id, "RSP", frame.cmd, "devID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
