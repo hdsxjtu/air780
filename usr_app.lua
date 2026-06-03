@@ -141,14 +141,14 @@ local function handle_sa_command(sock, frame)
     -- ----------------------------------------------------------------
     elseif frame.cmd == "FD" then
         if payload_map.url then
-            log.info("APP", "[FD] URL: " .. payload_map.url)
+            log.info("APP", "[FD] URL: " .. payload_map.url .. " size=" .. tostring(payload_map.size) .. " crc=" .. tostring(payload_map.crc))
             proto.as_tx(sock, frame.id, "RSP", "FD",
                 "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=downloading")
             sys.taskInit(function()
                 last_ota_mid = frame.id
                 last_ota_cmd = "FD"
                 sys.wait(500)
-                local ok = ota.download(payload_map.url)
+                local ok = ota.download(payload_map.url, tonumber(payload_map.size), tonumber(payload_map.crc))
                 -- 结果由 FOTA_STATE 事件回调上报，此处无需重复
             end)
         else

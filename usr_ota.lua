@@ -41,33 +41,7 @@ end
 
 
 
--- 持久化固件信息
-local INFO_FILE_PATH = "/mcu_fw_info.json"
-function ota.save_info(size, crc)
-    local f = io.open(INFO_FILE_PATH, "w")
-    if f then
-        f:write(string.format('{"size":%d,"crc":%u}', size, crc))
-        f:close()
-        log.info("OTA", "Saved firmware metadata: size=" .. size .. ", crc=" .. crc)
-        return true
-    end
-    return false
-end
 
-function ota.load_info()
-    local f = io.open(INFO_FILE_PATH, "r")
-    if not f then return nil end
-    local content = f:read("*a")
-    f:close()
-    if content then
-        local size = string.match(content, '"size":(%d+)')
-        local crc = string.match(content, '"crc":(%d+)')
-        if size and crc then
-            return {size = tonumber(size), crc = tonumber(crc)}
-        end
-    end
-    return nil
-end
 
 -- 内部工具: 字节串转16进制字符串
 local function to_hex(str)
@@ -86,14 +60,14 @@ end
 -- 成功: publish("FOTA_STATE", "fd_ok",   文件大小)
 -- 失败: publish("FOTA_STATE", "fd_error_xxx", 错误码)
 -- ============================================================
-function ota.download(url)
+function ota.download(url, expected_size, expected_crc)
     if not url or url == "" then
         log.error("OTA:FD", "Empty URL")
         sys.publish("FOTA_STATE", "fd_error_empty_url", -1)
         return false
     end
 
-    log.info("OTA:FD", "Downloading: " .. url)
+    log.info("OTA:FD", string.format("Downloading: %s (expected_size=%s, expected_crc=%s)", url, tostring(expected_size), tostring(expected_crc)))
 
     -- 诊断：下载前文件系统状态
     local f_before = io.open(MCU_FW_PATH, "rb")
@@ -141,6 +115,13 @@ function ota.download(url)
         return false
     end
 
+    if expected_size and fsize ~= expected_size then
+        log.error("OTA:FD", string.format("File size mismatch: expected %d, got %d", expected_size, fsize))
+        pcall(os.remove, MCU_FW_PATH)
+        sys.publish("FOTA_STATE", "fd_error_size", fsize)
+        return false
+    end
+
     -- 计算并验证 CRC32
     log.info("OTA:FD", "[DIAG] Starting CRC32, file=" .. tostring(fsize) .. " bytes ...")
     local crc_start = os.clock()
@@ -154,8 +135,14 @@ function ota.download(url)
         return false
     end
 
+    if expected_crc and crc ~= expected_crc then
+        log.error("OTA:FD", string.format("CRC32 mismatch: expected %u, got %u", expected_crc, crc))
+        pcall(os.remove, MCU_FW_PATH)
+        sys.publish("FOTA_STATE", "fd_error_crc", crc)
+        return false
+    end
+
     log.info("OTA:FD", string.format("Download OK. Size=%d bytes, CRC32=%u", fsize, crc))
-    ota.save_info(fsize, crc)
     sys.publish("FOTA_STATE", "fd_ok", {size = fsize, crc = crc})
     return true
 end
@@ -178,18 +165,8 @@ function ota.flash(crc)
         return false
     end
  
-    -- 优先使用传入的 CRC，若未传入则尝试从本地文件载入（避免重复慢计算）
-    local file_crc = crc
-    if not file_crc then
-        local saved = ota.load_info()
-        if saved and saved.size == fsize then
-            file_crc = saved.crc
-            log.info("OTA:FU", "Loaded CRC from storage: " .. tostring(file_crc))
-        else
-            log.warn("OTA:FU", "No saved CRC matched, calculating from local file...")
-            file_crc = crc32_file(MCU_FW_PATH)
-        end
-    end
+    -- 优先使用传入的 CRC，若未传入则直接对本地文件进行 CRC32 计算（秒级完成）
+    local file_crc = crc or crc32_file(MCU_FW_PATH)
 
     if not file_crc then
         log.error("OTA:FU", "CRC32 failed on local file")
