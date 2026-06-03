@@ -83,24 +83,6 @@ local function handle_sa_command(sock, frame)
     end
 
     if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
-        if frame.cmd == "CS" then
-            local modified = false
-            if payload_map.RPT_INT then
-                config.REPORT_INTERVAL = tonumber(payload_map.RPT_INT) * 60 * 1000
-                log.info("APP", "Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
-                modified = true
-            end
-            if payload_map.ADDR then
-                config.ADDR = tonumber(payload_map.ADDR)
-                log.info("APP", "Local ADDR updated to " .. config.ADDR)
-                -- 地址更新后，后续回复将自动使用新 ID
-                modified = true
-            end
-            if modified then
-                config.save()
-            end
-        end
-
         local retry_count = (frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT") and 1 or 3
         local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 1500, retry_count)
         
@@ -108,6 +90,33 @@ local function handle_sa_command(sock, frame)
             local p6 = proto.split_n(resp_line, ",", 6)
             local mcu_payload = p6[6] or ""
             last_mcu_alive = true
+            
+            -- 如果是 CS 指令且执行成功，此时将 MCU 确领并返回的新参数同步到 4G 模组本地并保存
+            if frame.cmd == "CS" then
+                local mcu_map = proto.parse_payload(mcu_payload)
+                local modified = false
+                if mcu_map.RPT_INT then
+                    config.REPORT_INTERVAL = tonumber(mcu_map.RPT_INT) * 60 * 1000
+                    log.info("APP", "CS Success: Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
+                    modified = true
+                end
+                if mcu_map.ADDR then
+                    config.ADDR = tonumber(mcu_map.ADDR)
+                    log.info("APP", "CS Success: Local ADDR updated to " .. config.ADDR)
+                    modified = true
+                elseif mcu_map.devID then
+                    local grabbed_addr = string.match(mcu_map.devID, "DEV(%d+)")
+                    if grabbed_addr then
+                        config.ADDR = tonumber(grabbed_addr)
+                        log.info("APP", "CS Success: Local ADDR (from devID) updated to " .. config.ADDR)
+                        modified = true
+                    end
+                end
+                if modified then
+                    config.save()
+                end
+            end
+
             local final_payload = mcu_payload
             if frame.cmd == "CG" or frame.cmd == "CS" then
                 final_payload = string.gsub(mcu_payload, "(devID=[^;]+;)", "%1gv=4G" .. _G.VERSION .. ";")

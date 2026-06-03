@@ -1,7 +1,7 @@
 -- Global Project Info
 -- Note: Must be defined as literals for LuatTools to recognize them
 PROJECT = "TRACKER_PRO"
-VERSION = "1.0.32"
+VERSION = "1.0.33"
 
 local sys = require("sys")
 local config = require("usr_config")
