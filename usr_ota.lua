@@ -2,6 +2,10 @@ local sys   = require("sys")
 local proto = require("usr_protocol")
 local ota   = {}
 
+-- 全局升级互斥锁，防止MCU升级和4G FOTA同时发生
+local ota_ongoing = false
+
+
 -- 获取文件大小 (标准 io，不依赖 lfs 模块)
 local function file_size(path)
     local f = io.open(path, "rb")
@@ -61,9 +65,17 @@ end
 -- 失败: publish("FOTA_STATE", "fd_error_xxx", 错误码)
 -- ============================================================
 function ota.download(url, expected_size, expected_crc)
+    if ota_ongoing then
+        log.error("OTA:FD", "OTA is already ongoing, reject download request")
+        sys.publish("FOTA_STATE", "fd_error_busy", -2)
+        return false
+    end
+    ota_ongoing = true
+
     if not url or url == "" then
         log.error("OTA:FD", "Empty URL")
         sys.publish("FOTA_STATE", "fd_error_empty_url", -1)
+        ota_ongoing = false
         return false
     end
 
@@ -103,6 +115,7 @@ function ota.download(url, expected_size, expected_crc)
         log.error("OTA:FD", "Download FAILED. HTTP code: " .. tostring(code))
         pcall(os.remove, MCU_FW_PATH)
         sys.publish("FOTA_STATE", "fd_error_http", code)
+        ota_ongoing = false
         return false
     end
 
@@ -112,6 +125,7 @@ function ota.download(url, expected_size, expected_crc)
         log.error("OTA:FD", "Invalid file size: " .. tostring(fsize))
         pcall(os.remove, MCU_FW_PATH)
         sys.publish("FOTA_STATE", "fd_error_size", fsize or 0)
+        ota_ongoing = false
         return false
     end
 
@@ -119,6 +133,7 @@ function ota.download(url, expected_size, expected_crc)
         log.error("OTA:FD", string.format("File size mismatch: expected %d, got %d", expected_size, fsize))
         pcall(os.remove, MCU_FW_PATH)
         sys.publish("FOTA_STATE", "fd_error_size", fsize)
+        ota_ongoing = false
         return false
     end
 
@@ -132,6 +147,7 @@ function ota.download(url, expected_size, expected_crc)
         log.error("OTA:FD", "CRC32 calculation failed")
         pcall(os.remove, MCU_FW_PATH)
         sys.publish("FOTA_STATE", "fd_error_crc", 0)
+        ota_ongoing = false
         return false
     end
 
@@ -139,11 +155,13 @@ function ota.download(url, expected_size, expected_crc)
         log.error("OTA:FD", string.format("CRC32 mismatch: expected %u, got %u", expected_crc, crc))
         pcall(os.remove, MCU_FW_PATH)
         sys.publish("FOTA_STATE", "fd_error_crc", crc)
+        ota_ongoing = false
         return false
     end
 
     log.info("OTA:FD", string.format("Download OK. Size=%d bytes, CRC32=%u", fsize, crc))
     sys.publish("FOTA_STATE", "fd_ok", {size = fsize, crc = crc})
+    ota_ongoing = false
     return true
 end
 
@@ -157,11 +175,19 @@ end
 -- 失败: publish("FOTA_STATE", "fu_error_xxx", 错误信息)
 -- ============================================================
 function ota.flash(crc)
+    if ota_ongoing then
+        log.error("OTA:FU", "OTA is already ongoing, reject flash request")
+        sys.publish("FOTA_STATE", "fu_error_busy", -2)
+        return false
+    end
+    ota_ongoing = true
+
     -- 检查本地固件文件是否存在且有效
     local fsize = file_size(MCU_FW_PATH)
     if not fsize or fsize == 0 or fsize > MCU_FW_MAX_SIZE then
         log.error("OTA:FU", "No valid firmware at " .. MCU_FW_PATH .. " (size=" .. tostring(fsize) .. ")")
         sys.publish("FOTA_STATE", "fu_error_no_file", 0)
+        ota_ongoing = false
         return false
     end
  
@@ -171,6 +197,7 @@ function ota.flash(crc)
     if not file_crc then
         log.error("OTA:FU", "CRC32 failed on local file")
         sys.publish("FOTA_STATE", "fu_error_crc", 0)
+        ota_ongoing = false
         return false
     end
  
@@ -187,6 +214,7 @@ function ota.flash(crc)
     if not boot_resp then
         log.error("OTA:FU", "BOOT failed — MCU may be offline")
         sys.publish("FOTA_STATE", "fu_error_ou", 0)
+        ota_ongoing = false
         return false
     end
     log.info("OTA:FU", "BOOT ACK received, MCU is rebooting into bootloader...")
@@ -199,6 +227,7 @@ function ota.flash(crc)
     if not hold_resp then
         log.error("OTA:FU", "Failed to hold Bootloader in rescue mode")
         sys.publish("FOTA_STATE", "fu_error_ou", 0)
+        ota_ongoing = false
         return false
     end
     log.info("OTA:FU", "Bootloader is successfully locked in rescue mode. Preparing OU...")
@@ -213,6 +242,7 @@ function ota.flash(crc)
     if not ou_resp then
         log.error("OTA:FU", "OU rejected by Boot (MCU not in boot mode?)")
         sys.publish("FOTA_STATE", "fu_error_ou", 0)
+        ota_ongoing = false
         return false
     end
     log.info("OTA:FU", "OU OK — APP run area erased")
@@ -226,6 +256,7 @@ function ota.flash(crc)
         log.error("OTA:FU", "Cannot open " .. MCU_FW_PATH)
         proto.request_mcu(mid, "RESET", "", 500, 1)  -- 复位，APP区已擦，Boot自然留下
         sys.publish("FOTA_STATE", "fu_error_open_file", 0)
+        ota_ongoing = false
         return false
     end
  
@@ -233,7 +264,7 @@ function ota.flash(crc)
     local tx_ok = true
  
     while true do
-        local chunk = f:read(128)
+        local chunk = f:read(64)
         if not chunk or #chunk == 0 then break end
  
         local payload = string.format("block=%d;len=%d;data=%s",
@@ -256,6 +287,7 @@ function ota.flash(crc)
         log.error("OTA:FU", "Transmission failed at block " .. block_idx .. ", sending RESET")
         proto.request_mcu(mid, "RESET", "", 500, 1)
         sys.publish("FOTA_STATE", "fu_error_tx", block_idx)
+        ota_ongoing = false
         return false
     end
  
@@ -270,6 +302,7 @@ function ota.flash(crc)
         log.error("OTA:FU", "OE commit failed, sending RESET")
         proto.request_mcu(mid, "RESET", "", 500, 1)
         sys.publish("FOTA_STATE", "fu_error_oe", 0)
+        ota_ongoing = false
         return false
     end
 
@@ -282,6 +315,7 @@ function ota.flash(crc)
     end
 
     sys.publish("FOTA_STATE", "fu_ok", 0)
+    ota_ongoing = false
     return true
 end
 
@@ -289,9 +323,17 @@ end
 -- 4G 模组自身 FOTA 升级（保留原有功能）
 -- ============================================================
 function ota.start(url)
+    if ota_ongoing then
+        log.error("OTA:4G", "OTA is already ongoing, reject 4G FOTA request")
+        sys.publish("FOTA_STATE", "4g_error_busy", -2)
+        return false
+    end
+    ota_ongoing = true
+
     if not url or url == "" then
         log.error("OTA:4G", "Empty URL")
         sys.publish("FOTA_STATE", "4g_error_empty_url", -1)
+        ota_ongoing = false
         return false
     end
     log.info("OTA:4G", "Starting 4G FOTA from: " .. url)
@@ -306,6 +348,7 @@ function ota.start(url)
     else
         log.error("OTA:4G", "FOTA failed: " .. tostring(code))
         sys.publish("FOTA_STATE", "4g_error_http", code)
+        ota_ongoing = false
     end
     return code == 200
 end
