@@ -38,6 +38,9 @@ end
 
 -- [[ 内部逻辑：静默刷新 GPS 缓存 ]]
 local function update_gps_cache()
+    if last_lat and last_lng then
+        return -- 已经有GPS信息，不再定位
+    end
     sys.taskInit(function()
         local res, lat, lng = lbs.getLocation()
         if res == 0 then
@@ -331,9 +334,11 @@ local function timer_task()
         log.info("APP", "--- Starting Reporting Cycle ---")
         local current_devid = get_device_id()
 
-        -- 2. 同步定位 (解开忙锁，避免基站定位的 10~30 秒内拒接服务器指令)
-        local res, lat, lng = lbs.getLocation()
-        if res == 0 then last_lat, last_lng = lat, lng end
+        -- 2. 同步定位 (仅在本地没有 GPS/LBS 数据时获取，避免重复定位消耗功耗)
+        if not last_lat or not last_lng then
+            local res, lat, lng = lbs.getLocation()
+            if res == 0 then last_lat, last_lng = lat, lng end
+        end
 
         -- 1. 等待串口业务空闲并上锁
         local wait_count = 0
@@ -455,7 +460,11 @@ sys.subscribe("FOTA_STATE", function(status_name, result)
         local current_devid = get_device_id()
         -- 使用原始指令类型 (FD/FU/OU)，而非统一写死 OU
         local rsp_cmd = last_ota_cmd or "OU"
-        local payload = "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=" .. status_name
+        local status_str = status_name
+        if status_name == "fu_progress" then
+            status_str = "flashing_" .. tostring(result) .. "%"
+        end
+        local payload = "devID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=" .. status_str
         if status_name == "fd_ok" and type(result) == "table" then
             -- CRC 转 uint32 十六进制显示 (兼容负数)
             local crc_u32 = result.crc
@@ -466,7 +475,7 @@ sys.subscribe("FOTA_STATE", function(status_name, result)
             local crc_u32 = result
             if crc_u32 < 0 then crc_u32 = crc_u32 + 0x100000000 end
             payload = payload .. ";crc=0x" .. string.format("%08X", crc_u32)
-        elseif result then
+        elseif result and status_name ~= "fu_progress" then
             payload = payload .. ";val=" .. tostring(result)
         end
         proto.as_tx(netc, last_ota_mid, "RSP", rsp_cmd, payload)

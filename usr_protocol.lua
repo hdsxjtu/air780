@@ -13,8 +13,8 @@ function proto.set_debug_socket(sock)
 end
 
 function proto.trace_to_server(action, cmd, data)
-    if debug_sock then
-        -- 静默异步发送调试报文，前缀为 EVT，命令为 DEBUG
+    if debug_sock and cmd ~= "OD" and cmd ~= "MS" and cmd ~= "CG" and cmd ~= "MR" then
+        -- 静默异步发送调试报文，前缀为 EVT，命令为 DEBUG (过滤高频的 OD 以及频繁的 MS、CG、MR 调试帧)
         sys.taskInit(function()
             local clean_data = string.gsub(data or "", "[\r\n]", "")
             if string.len(clean_data) > 100 then

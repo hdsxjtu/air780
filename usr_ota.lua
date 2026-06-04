@@ -262,6 +262,8 @@ function ota.flash(crc)
  
     local block_idx = 0
     local tx_ok = true
+    local total_blocks = math.ceil(fsize / 64)
+    local last_reported_percent = -10
  
     while true do
         local chunk = f:read(64)
@@ -277,6 +279,12 @@ function ota.flash(crc)
             break
         end
  
+        local percent = math.floor(((block_idx + 1) / total_blocks) * 100)
+        if percent - last_reported_percent >= 10 or percent == 100 then
+            last_reported_percent = percent
+            sys.publish("FOTA_STATE", "fu_progress", percent)
+        end
+
         block_idx = block_idx + 1
         sys.wait(10)   -- 让出 CPU，防止看门狗超时
     end
