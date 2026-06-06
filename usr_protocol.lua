@@ -113,7 +113,7 @@ function proto.modem_payload(imei, mcu_alive, lat, lng)
         rsrp = mobile.rsrp()
     end
     local mdead = mcu_alive and "0" or "1"
-    local payload = "devID=" .. imei .. ";gv=4G" .. _G.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
+    local payload = "ID=" .. imei .. ";gv=4G" .. _G.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
     if lat and lng then
         payload = payload .. ";lat=" .. lat .. ";lng=" .. lng
     end
