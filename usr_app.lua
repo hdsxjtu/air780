@@ -157,10 +157,14 @@ local function handle_sa_command(sock, frame)
         -- 2. 启动异步后台定位并在完成后上报 RSP
         sys.taskInit(function()
             local res, lat, lng = lbs.getLocation()
+            local report_lat, report_lng
             if res == 0 then
                 last_lat, last_lng = lat, lng
+                report_lat, report_lng = lat, lng
+            else
+                report_lat, report_lng = "-1", "-1"
             end
-            proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, last_lat, last_lng))
+            proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, report_lat, report_lng))
         end)
     -- ----------------------------------------------------------------
     -- FD: Firmware Download — 强制下载固件到4G模组本地，不碰单片机
