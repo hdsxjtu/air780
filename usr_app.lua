@@ -237,13 +237,10 @@ local function network_task()
         if socket.localIP() == "0.0.0.0" or socket.localIP() == nil then
             sys.waitUntil("IP_READY")
         end
-        log.info("APP", "Network Ready, connecting to " .. config.SERVER_IP)
+        log.info("NET", "Connecting to server: " .. config.SERVER_IP .. ":" .. config.SERVER_PORT)
         
         local rxbuff = zbuff.create(1024)
         netc = socket.create(nil, function(sc, event)
-            log.info("udp_event", string.format("%08X", event))
-            
-            -- 注意：demo 中使用的是 socket.EVENT (或者是具体的 RX 常量)
             -- 只要有事件进来，由于是无连接的 UDP，大概率是收到了数据
             if event == socket.EVENT or event == socket.EVENT_RX or event == socket.EVENT_RECV then
                 -- 必须循环读取，直到读空，防止 UDP 缓冲区堆积导致丢包 (关键加固)
@@ -263,7 +260,7 @@ local function network_task()
                     end
                 end
             elseif event == socket.EVENT_CLOSE then
-                log.error("UDP_EVENT", "Socket closed by remote or network!")
+                log.error("NET", "Socket closed by remote or network!")
                 sys.publish("SOCKET_CLOSED")
             end
         end)
@@ -287,7 +284,7 @@ end
 local function timer_task()
     -- 第一阶段：开机获取到网络，在 log 提示并闪烁指示灯 3 次，每次 100ms
     sys.waitUntil("SOCKET_CONNECTED")
-    log.info("APP", "Network Ready. Network connection established successfully!")
+    log.info("NET", "Network Ready. Connection established successfully!")
     
     for i = 1, 3 do
         led.on()
@@ -322,9 +319,9 @@ local function timer_task()
         if modified then
             config.save()
         end
-        log.info("APP", "Successfully synced config from MCU on boot. ID=" .. get_device_id())
+        log.info("BOOT", "MCU Sync SUCCESS. Active ID: " .. get_device_id())
     else
-        log.info("APP", "MCU no response on boot, using local saved config. ID=" .. get_device_id())
+        log.info("BOOT", "MCU Sync TIMEOUT. Active ID: " .. get_device_id())
     end
     mcu_is_busy = false
     
@@ -337,9 +334,7 @@ local function timer_task()
 
     -- 第二阶段：正常周期循环 (开机立即执行一次 MG)
     while true do
-        log.info("APP", "--- Starting Reporting Cycle ---")
         local current_devid = get_device_id()
-
 
         -- 1. 等待串口业务空闲并上锁
         local wait_count = 0
@@ -347,13 +342,12 @@ local function timer_task()
         mcu_is_busy = true
 
         -- 3. 触发采样 (MG)
-        log.info("APP", "Triggering MCU Measurement")
-        local current_devid = get_device_id()
+        log.info("CYCLE", "Trigger MG (ID=" .. current_devid .. ")")
         local mg_resp = proto.request_mcu(proto.next_id(), "MG", "ID=" .. current_devid, 700, 3)
         last_mcu_alive = (mg_resp ~= nil)
 
         if not last_mcu_alive then
-            log.error("APP", "MCU Offline confirmed")
+            log.error("CYCLE", "MCU Offline! Report EVT,MD")
             proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, false, last_lat, last_lng))
             if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
         end
@@ -363,7 +357,7 @@ local function timer_task()
         mcu_is_busy = false
         
         -- 4. 周期休眠
-        log.info("APP", "Cycle finished. Sleeping for " .. (config.REPORT_INTERVAL / 60000) .. " min")
+        log.info("CYCLE", "Sleep " .. (config.REPORT_INTERVAL / 60000) .. " min")
         sys.wait(config.REPORT_INTERVAL)
     end
 end
