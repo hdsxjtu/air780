@@ -19,7 +19,6 @@ local last_mcu_alive = true -- 记录单片机是否正常（心跳用）
 local last_lat, last_lng = nil, nil -- GPS/LBS 坐标缓存
 local mcu_is_busy = false    -- 业务锁：记录当前模组是否正占用串口与单片机交互
 local boot_synced = false    -- 握手标志：开机由于系统响应解锁
-local lbs_permanent_fail = false -- 记录定位是否曾发生过失败
 
 -- [[ 新增：指令队列机制，防止丢包 ]]
 local sa_cmd_queue = {}
@@ -156,20 +155,14 @@ local function handle_sa_command(sock, frame)
         
         -- 2. 启动异步后台定位并在完成后上报 RSP
         sys.taskInit(function()
+            local res, lat, lng = lbs.getLocation()
             local report_lat, report_lng
-            if lbs_permanent_fail then
-                log.info("LBS", "Skip LBS due to previous failure. Return -1.")
-                report_lat, report_lng = "-1", "-1"
+            if res == 0 then
+                last_lat, last_lng = lat, lng
+                report_lat, report_lng = lat, lng
             else
-                local res, lat, lng = lbs.getLocation()
-                if res == 0 then
-                    last_lat, last_lng = lat, lng
-                    report_lat, report_lng = lat, lng
-                else
-                    lbs_permanent_fail = true
-                    report_lat, report_lng = "-1", "-1"
-                    log.warn("LBS", "LBS positioning failed. Permanent failure flag set.")
-                end
+                report_lat = last_lat or "-1"
+                report_lng = last_lng or "-1"
             end
             proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, report_lat, report_lng))
         end)
