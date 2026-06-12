@@ -96,36 +96,46 @@ local function handle_sa_command(sock, frame)
             -- 如果是 CS 或 CG 指令且执行成功，此时将 MCU 确领并返回的新参数同步到 4G 模组本地并保存
             if frame.cmd == "CS" or frame.cmd == "CG" then
                 local mcu_map = proto.parse_payload(mcu_payload)
-                local modified = false
-                if mcu_map.RPT then
-                    local new_rpt = tonumber(mcu_map.RPT) * 60 * 1000
-                    if config.REPORT_INTERVAL ~= new_rpt then
-                        config.REPORT_INTERVAL = new_rpt
-                        log.info("APP", frame.cmd .. " Success: Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
-                        modified = true
-                        sys.publish("REPORT_INTERVAL_UPDATED")
+                local is_success = true
+                if frame.cmd == "CS" then
+                    if mcu_map.ack and tonumber(mcu_map.ack) ~= 1 then
+                        is_success = false
                     end
                 end
-                if mcu_map.ADDR then
-                    local new_addr = tonumber(mcu_map.ADDR)
-                    if config.ADDR ~= new_addr then
-                        config.ADDR = new_addr
-                        log.info("APP", frame.cmd .. " Success: Local ADDR updated to " .. config.ADDR)
-                        modified = true
-                    end
-                elseif mcu_map.ID then
-                    local grabbed_addr = string.match(mcu_map.ID, "(%d+)")
-                    if grabbed_addr then
-                        local new_addr = tonumber(grabbed_addr)
-                        if config.ADDR ~= new_addr then
-                            config.ADDR = new_addr
-                            log.info("APP", frame.cmd .. " Success: Local ADDR (from ID) updated to " .. config.ADDR)
+
+                if is_success then
+                    local source_map = (frame.cmd == "CS") and payload_map or mcu_map
+                    local modified = false
+                    if source_map.RPT then
+                        local new_rpt = tonumber(source_map.RPT) * 60 * 1000
+                        if config.REPORT_INTERVAL ~= new_rpt then
+                            config.REPORT_INTERVAL = new_rpt
+                            log.info("APP", frame.cmd .. " Success: Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
                             modified = true
+                            sys.publish("REPORT_INTERVAL_UPDATED")
                         end
                     end
-                end
-                if modified then
-                    config.save()
+                    if source_map.ADDR then
+                        local new_addr = tonumber(source_map.ADDR)
+                        if config.ADDR ~= new_addr then
+                            config.ADDR = new_addr
+                            log.info("APP", frame.cmd .. " Success: Local ADDR updated to " .. config.ADDR)
+                            modified = true
+                        end
+                    elseif source_map.ID then
+                        local grabbed_addr = string.match(source_map.ID, "(%d+)")
+                        if grabbed_addr then
+                            local new_addr = tonumber(grabbed_addr)
+                            if config.ADDR ~= new_addr then
+                                config.ADDR = new_addr
+                                log.info("APP", frame.cmd .. " Success: Local ADDR (from ID) updated to " .. config.ADDR)
+                                modified = true
+                            end
+                        end
+                    end
+                    if modified then
+                        config.save()
+                    end
                 end
             end
 
