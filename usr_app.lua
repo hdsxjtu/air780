@@ -492,7 +492,6 @@ function app.start()
     uart.onReceive(function(line) sys.publish("UART_RECV", line) end)
     sys.taskInit(network_task); sys.taskInit(heartbeat_task)
     sys.taskInit(timer_task); sys.taskInit(uart_task); sys.taskInit(sa_command_task)
-    sys.taskInit(function() while true do led.blink(100); sys.wait(10000) end end)
 end
 
 return app

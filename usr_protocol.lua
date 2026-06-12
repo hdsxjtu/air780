@@ -2,6 +2,7 @@ local sys = require("sys")
 local config = require("usr_config")
 local mobile = _G.mobile
 local uart = require("usr_uart")
+local led = require("usr_led")
 
 local proto = {}
 proto.last_tx_time = 0
@@ -103,6 +104,7 @@ function proto.as_tx(sock, mid, frame_type, cmd, payload)
         socket.tx(sock, message)
         log.info("UDP_TX", message)
         proto.last_tx_time = os.time()
+        sys.taskInit(led.blink, 50)
     end
 end
 
@@ -194,6 +196,7 @@ function proto.am_tx(mid, frame_type, cmd, payload)
     uart.send(message .. "\r\n")
     log.info("UART_TX", message)
     proto.trace_to_server("TX", cmd, message)
+    sys.taskInit(led.blink, 50)
     
     uart_locked = false
     sys.publish("UART_UNLOCK")
