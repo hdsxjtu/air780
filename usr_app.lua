@@ -19,7 +19,6 @@ local last_mcu_alive = true -- 记录单片机是否正常（心跳用）
 local last_lat, last_lng = nil, nil -- GPS/LBS 坐标缓存
 local mcu_is_busy = false    -- 业务锁：记录当前模组是否正占用串口与单片机交互
 local boot_synced = false    -- 握手标志：开机由于系统响应解锁
-local last_mcu_ready = false -- 记录开机握手是否真正成功
 
 -- [[ 新增：指令队列机制，防止丢包 ]]
 local sa_cmd_queue = {}
@@ -286,60 +285,22 @@ end
 
 -- [[ 任务 2：定时上报任务 ]]
 local function timer_task()
-    -- 第一阶段：开机强制同步 (100% 解决地址/间隔未知问题)
+    -- 第一阶段：开机获取到网络，在 log 提示并闪烁指示灯 3 次，每次 100ms
     sys.waitUntil("SOCKET_CONNECTED")
-    log.info("APP", "Network Ready. Starting Initial MCU Handshake...")
+    log.info("APP", "Network Ready. Network connection established successfully!")
     
-    mcu_is_busy = true
-    for i = 1, 20 do
-        log.info("APP", ">>> [BOOT_SYNC] Attempt #" .. i .. " / 20 - Requesting CG <<<")
-        local current_devid = get_device_id()
-        local sync_line = proto.request_mcu(proto.next_id(), "CG", "ID=" .. current_devid, 1500, 1)
-        
-        if sync_line then
-            local p6 = proto.split_n(sync_line, ",", 6)
-            local mcu_map = proto.parse_payload(p6[6])
-            
-            local modified = false
-            -- 单片机的 ADDR 仅用于物理区分
-            if mcu_map.ADDR then 
-                config.ADDR = tonumber(mcu_map.ADDR) 
-                modified = true
-            elseif mcu_map.ID then
-                -- 【动态认主】如果在应答头里发现它叫 5，直接认领
-                local grabbed_addr = string.match(mcu_map.ID, "(%d+)")
-                if grabbed_addr then 
-                    config.ADDR = tonumber(grabbed_addr) 
-                    modified = true
-                end
-            end
-            
-            if mcu_map.RPT then 
-                config.REPORT_INTERVAL = tonumber(mcu_map.RPT) * 60 * 1000 
-                modified = true
-            end
-
-            if modified then
-                config.save()
-            end
-            
-            local current_devid = get_device_id()
-            log.info("APP", "Initial Sync Handshake hit. Active ID=" .. current_devid)
-            last_mcu_ready = true
-            sys.publish("BOOT_SYNC_DONE")
-            break
-        end
-        sys.wait(1000)
+    for i = 1, 3 do
+        led.on()
+        sys.wait(100)
+        led.off()
+        sys.wait(100)
     end
-    mcu_is_busy = false
-    boot_synced = true            -- 无论是否成功同步，都解锁系统响应，防止模组死等
+    
+    boot_synced = true
     sys.publish("BOOT_SYNC_DONE") -- 通知心跳任务可以开始了
 
-    if not last_mcu_ready then
-        log.error("APP", "Initial Sync FAILED after 20 tries - Using default config")
-    else
-        -- 初始握手成功，发包后立即释放 RRC 节省开机功耗
-        if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
+    if mobile and mobile.rrcRelease then
+        mobile.rrcRelease(true)
     end
 
     -- 第二阶段：正常周期循环 (开机立即执行一次 MG)
