@@ -85,26 +85,7 @@ local function handle_sa_command(sock, frame)
     end
 
     if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
-        -- 如果是 CS 指令，即使单片机不在线，4G 模组也应当立即将服务器下发的参数保存到本地，并唤醒当前可能处于超长等待的休眠周期
-        if frame.cmd == "CS" then
-            local modified = false
-            if payload_map.RPT then
-                config.REPORT_INTERVAL = tonumber(payload_map.RPT) * 60 * 1000
-                log.info("APP", "CS Command: Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
-                modified = true
-                sys.publish("REPORT_INTERVAL_UPDATED")
-            end
-            if payload_map.ADDR then
-                config.ADDR = tonumber(payload_map.ADDR)
-                log.info("APP", "CS Command: Local ADDR updated to " .. config.ADDR)
-                modified = true
-            end
-            if modified then
-                config.save()
-            end
-        end
-
-        local retry_count = (frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT") and 1 or 3
+        local retry_count = (frame.cmd == "RESET" or frame.cmd == "BOOT") and 1 or 3
         local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 1500, retry_count)
         
         if resp_line then
