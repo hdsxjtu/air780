@@ -296,6 +296,38 @@ local function timer_task()
         sys.wait(100)
     end
     
+    boot_synced = false
+    -- 尝试温和同步一次单片机参数 (CG)
+    mcu_is_busy = true
+    local current_devid = get_device_id()
+    local sync_line = proto.request_mcu(proto.next_id(), "CG", "ID=" .. current_devid, 1500, 1)
+    if sync_line then
+        local p6 = proto.split_n(sync_line, ",", 6)
+        local mcu_map = proto.parse_payload(p6[6])
+        local modified = false
+        if mcu_map.ADDR then
+            config.ADDR = tonumber(mcu_map.ADDR)
+            modified = true
+        elseif mcu_map.ID then
+            local grabbed_addr = string.match(mcu_map.ID, "(%d+)")
+            if grabbed_addr then
+                config.ADDR = tonumber(grabbed_addr)
+                modified = true
+            end
+        end
+        if mcu_map.RPT then
+            config.REPORT_INTERVAL = tonumber(mcu_map.RPT) * 60 * 1000
+            modified = true
+        end
+        if modified then
+            config.save()
+        end
+        log.info("APP", "Successfully synced config from MCU on boot. ID=" .. get_device_id())
+    else
+        log.info("APP", "MCU no response on boot, using local saved config. ID=" .. get_device_id())
+    end
+    mcu_is_busy = false
+    
     boot_synced = true
     sys.publish("BOOT_SYNC_DONE") -- 通知心跳任务可以开始了
 
