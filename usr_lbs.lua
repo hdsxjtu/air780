@@ -21,6 +21,8 @@ function lbs.getLocation()
         if not result then
             log.warn("LBS", "Cell Info Update Timed Out")
         end
+        -- Delay 1.5s to let neighbor cells and measurement data fully stabilize
+        sys.wait(1500)
     else
         log.warn("LBS", "Mobile/LBS hardware not available on this platform")
     end
