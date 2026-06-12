@@ -285,6 +285,7 @@ end
 -- [[ 任务 2：定时上报任务 ]]
 local function timer_task()
     -- 第一阶段：开机获取到网络，在 log 提示并闪烁指示灯 3 次，每次 100ms
+    sys.waitUntil("SOCKET_CONNECTED")
     log.info("NET", "Network Ready. Connection established successfully!")
     
     for i = 1, 3 do
