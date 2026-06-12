@@ -93,26 +93,35 @@ local function handle_sa_command(sock, frame)
             local mcu_payload = p6[6] or ""
             last_mcu_alive = true
             
-            -- 如果是 CS 指令且执行成功，此时将 MCU 确领并返回的新参数同步到 4G 模组本地并保存
-            if frame.cmd == "CS" then
+            -- 如果是 CS 或 CG 指令且执行成功，此时将 MCU 确领并返回的新参数同步到 4G 模组本地并保存
+            if frame.cmd == "CS" or frame.cmd == "CG" then
                 local mcu_map = proto.parse_payload(mcu_payload)
                 local modified = false
                 if mcu_map.RPT then
-                    config.REPORT_INTERVAL = tonumber(mcu_map.RPT) * 60 * 1000
-                    log.info("APP", "CS Success: Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
-                    modified = true
-                    sys.publish("REPORT_INTERVAL_UPDATED")
+                    local new_rpt = tonumber(mcu_map.RPT) * 60 * 1000
+                    if config.REPORT_INTERVAL ~= new_rpt then
+                        config.REPORT_INTERVAL = new_rpt
+                        log.info("APP", frame.cmd .. " Success: Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
+                        modified = true
+                        sys.publish("REPORT_INTERVAL_UPDATED")
+                    end
                 end
                 if mcu_map.ADDR then
-                    config.ADDR = tonumber(mcu_map.ADDR)
-                    log.info("APP", "CS Success: Local ADDR updated to " .. config.ADDR)
-                    modified = true
+                    local new_addr = tonumber(mcu_map.ADDR)
+                    if config.ADDR ~= new_addr then
+                        config.ADDR = new_addr
+                        log.info("APP", frame.cmd .. " Success: Local ADDR updated to " .. config.ADDR)
+                        modified = true
+                    end
                 elseif mcu_map.ID then
                     local grabbed_addr = string.match(mcu_map.ID, "(%d+)")
                     if grabbed_addr then
-                        config.ADDR = tonumber(grabbed_addr)
-                        log.info("APP", "CS Success: Local ADDR (from ID) updated to " .. config.ADDR)
-                        modified = true
+                        local new_addr = tonumber(grabbed_addr)
+                        if config.ADDR ~= new_addr then
+                            config.ADDR = new_addr
+                            log.info("APP", frame.cmd .. " Success: Local ADDR (from ID) updated to " .. config.ADDR)
+                            modified = true
+                        end
                     end
                 end
                 if modified then
