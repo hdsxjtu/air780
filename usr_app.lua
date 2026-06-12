@@ -151,8 +151,17 @@ local function handle_sa_command(sock, frame)
             proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
         end
     elseif frame.cmd == "MD" then
-        update_gps_cache() 
-        proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, last_lat, last_lng))
+        -- 1. 立即回复一阶段 ACK，防止服务器超时
+        proto.as_tx(sock, frame.id, "ACK", "MD", "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS)
+        
+        -- 2. 启动异步后台定位并在完成后上报 RSP
+        sys.taskInit(function()
+            local res, lat, lng = lbs.getLocation()
+            if res == 0 then
+                last_lat, last_lng = lat, lng
+            end
+            proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, last_lat, last_lng))
+        end)
     -- ----------------------------------------------------------------
     -- FD: Firmware Download — 强制下载固件到4G模组本地，不碰单片机
     -- 服务端发: SA,1,XXXX,CMD,FD,ID=1;url=http://xxx/fw.bin
@@ -334,11 +343,6 @@ local function timer_task()
         log.info("APP", "--- Starting Reporting Cycle ---")
         local current_devid = get_device_id()
 
-        -- 2. 同步定位 (仅在本地没有 GPS/LBS 数据时获取，避免重复定位消耗功耗)
-        if not last_lat or not last_lng then
-            local res, lat, lng = lbs.getLocation()
-            if res == 0 then last_lat, last_lng = lat, lng end
-        end
 
         -- 1. 等待串口业务空闲并上锁
         local wait_count = 0
