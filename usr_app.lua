@@ -101,6 +101,7 @@ local function handle_sa_command(sock, frame)
                     config.REPORT_INTERVAL = tonumber(mcu_map.RPT) * 60 * 1000
                     log.info("APP", "CS Success: Local REPORT_INTERVAL updated to " .. config.REPORT_INTERVAL .. "ms")
                     modified = true
+                    sys.publish("REPORT_INTERVAL_UPDATED")
                 end
                 if mcu_map.ADDR then
                     config.ADDR = tonumber(mcu_map.ADDR)
@@ -284,7 +285,6 @@ end
 -- [[ 任务 2：定时上报任务 ]]
 local function timer_task()
     -- 第一阶段：开机获取到网络，在 log 提示并闪烁指示灯 3 次，每次 100ms
-    sys.waitUntil("SOCKET_CONNECTED")
     log.info("NET", "Network Ready. Connection established successfully!")
     
     for i = 1, 3 do
@@ -316,6 +316,7 @@ local function timer_task()
         if mcu_map.RPT then
             config.REPORT_INTERVAL = tonumber(mcu_map.RPT) * 60 * 1000
             modified = true
+            sys.publish("REPORT_INTERVAL_UPDATED")
         end
         if modified then
             config.save()
@@ -359,7 +360,7 @@ local function timer_task()
         
         -- 4. 周期休眠
         log.info("CYCLE", "Sleep " .. (config.REPORT_INTERVAL / 60000) .. " min")
-        sys.wait(config.REPORT_INTERVAL)
+        sys.waitUntil("REPORT_INTERVAL_UPDATED", config.REPORT_INTERVAL)
     end
 end
 

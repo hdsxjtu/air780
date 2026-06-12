@@ -1,7 +1,7 @@
 -- Global Project Info
 -- Note: Must be defined as literals for LuatTools to recognize them
 PROJECT = "TRACKER_PRO"
-VERSION = "1.0.59"
+VERSION = "1.0.60"
 
 log.info("MAIN", "PROJECT: " .. PROJECT .. " VERSION: " .. VERSION)
 
