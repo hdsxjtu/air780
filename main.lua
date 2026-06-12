@@ -1,7 +1,12 @@
 -- Global Project Info
 -- Note: Must be defined as literals for LuatTools to recognize them
 PROJECT = "TRACKER_PRO"
-VERSION = "1.0.53"
+VERSION = "1.0.54"
+
+-- 初始化 LED 并立即关闭，防止上电瞬间闪烁或长亮
+local led = require("usr_led")
+led.init()
+led.off()
 
 local sys = require("sys")
 local config = require("usr_config")

@@ -295,7 +295,7 @@ local function timer_task()
         led.off()
         sys.wait(100)
     end
-    
+    sys.wait(5000)
     boot_synced = false
     -- 尝试温和同步一次单片机参数 (CG)
     mcu_is_busy = true

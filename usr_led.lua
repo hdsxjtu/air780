@@ -9,6 +9,7 @@ local led = {}
 -- Initialize the LED GPIO
 function led.init()
     gpio.setup(config.LED_PIN, 1) -- Default OFF (High)
+    gpio.set(config.LED_PIN, 1)   -- Force OFF immediately (Active Low)
 end
 
 -- Turn LED On
