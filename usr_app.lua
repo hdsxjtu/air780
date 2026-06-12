@@ -85,7 +85,7 @@ local function handle_sa_command(sock, frame)
     end
 
     if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
-        local retry_count = (frame.cmd == "RESET" or frame.cmd == "BOOT") and 1 or 3
+        local retry_count = (frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT") and 1 or 3
         local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 1500, retry_count)
         
         if resp_line then
