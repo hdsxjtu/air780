@@ -16,7 +16,7 @@ local mobile = _G.mobile
 local app = {}
 local netc = nil            -- 全局网络连接句柄 (UDP Socket)
 local last_mcu_alive = true -- 记录单片机是否正常（心跳用）
-local last_lat, last_lng = nil, nil -- GPS/LBS 坐标缓存
+local last_lat, last_lng = config.LAT, config.LNG -- GPS/LBS 坐标缓存
 local mcu_is_busy = false    -- 业务锁：记录当前模组是否正占用串口与单片机交互
 local boot_synced = false    -- 握手标志：开机由于系统响应解锁
 
@@ -42,8 +42,10 @@ local function update_gps_cache()
     end
     sys.taskInit(function()
         local res, lat, lng = lbs.getLocation()
-        if res == 0 then
+        if res == 0 and lat and lng and lat ~= "" and lng ~= "" then
             last_lat, last_lng = lat, lng
+            config.LAT, config.LNG = lat, lng
+            config.save()
             log.info("APP", "GPS Cache Updated: " .. lat .. "," .. lng)
         end
     end)
@@ -177,8 +179,10 @@ local function handle_sa_command(sock, frame)
         sys.taskInit(function()
             local res, lat, lng = lbs.getLocation()
             local report_lat, report_lng
-            if res == 0 then
+            if res == 0 and lat and lng and lat ~= "" and lng ~= "" then
                 last_lat, last_lng = lat, lng
+                config.LAT, config.LNG = lat, lng
+                config.save()
                 report_lat, report_lng = lat, lng
             else
                 report_lat = last_lat or "-1"

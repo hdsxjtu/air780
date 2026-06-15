@@ -33,10 +33,10 @@ local CONFIG_FILE = "/usr_config.json"
 function config.save()
     local f = io.open(CONFIG_FILE, "w")
     if f then
-        f:write(string.format('{"ADDR":%d,"REPORT_INTERVAL":%d}', 
-            config.ADDR or 1, config.REPORT_INTERVAL or (60 * 60 * 1000)))
+        f:write(string.format('{"ADDR":%d,"REPORT_INTERVAL":%d,"LAT":"%s","LNG":"%s"}', 
+            config.ADDR or 1, config.REPORT_INTERVAL or (60 * 60 * 1000), config.LAT or "", config.LNG or ""))
         f:close()
-        log.info("CONFIG", "Saved local config: ADDR=" .. tostring(config.ADDR) .. ", RPT=" .. tostring(config.REPORT_INTERVAL))
+        log.info("CONFIG", "Saved local config: ADDR=" .. tostring(config.ADDR) .. ", RPT=" .. tostring(config.REPORT_INTERVAL) .. ", LAT=" .. tostring(config.LAT) .. ", LNG=" .. tostring(config.LNG))
         return true
     end
     return false
@@ -53,13 +53,21 @@ function config.load()
     if content then
         local addr = string.match(content, '"ADDR":(%d+)')
         local rpt = string.match(content, '"REPORT_INTERVAL":(%d+)')
+        local lat = string.match(content, '"LAT":"(.-)"')
+        local lng = string.match(content, '"LNG":"(.-)"')
         if addr then
             config.ADDR = tonumber(addr)
         end
         if rpt then
             config.REPORT_INTERVAL = tonumber(rpt)
         end
-        log.info("CONFIG", "Loaded saved config: ADDR=" .. tostring(config.ADDR) .. ", RPT=" .. tostring(config.REPORT_INTERVAL))
+        if lat and lat ~= "" then
+            config.LAT = lat
+        end
+        if lng and lng ~= "" then
+            config.LNG = lng
+        end
+        log.info("CONFIG", "Loaded saved config: ADDR=" .. tostring(config.ADDR) .. ", RPT=" .. tostring(config.REPORT_INTERVAL) .. ", LAT=" .. tostring(config.LAT) .. ", LNG=" .. tostring(config.LNG))
         return true
     end
     return false
