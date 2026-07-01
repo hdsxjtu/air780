@@ -32,8 +32,33 @@ local function get_device_id()
     if config.DEVICE_ID then
         return config.DEVICE_ID
     end
-    return tostring(config.ADDR or "1")
+    return tostring(config.TYPE or "TY") .. tostring(config.ADDR or "1")
 end
+
+-- [[ 新增：解析 MCU 帧动态纠正本地 ID 认知 ]]
+local function sync_mcu_identity(mcu_payload)
+    if not mcu_payload then return end
+    local type_part, addr_part = string.match(mcu_payload, "ID=([A-Z]*)(%d+)")
+    if addr_part then
+        local learned_addr = tonumber(addr_part)
+        local learned_type = (type_part ~= "") and type_part or "TY"
+        local changed = false
+
+        if config.ADDR ~= learned_addr then
+            config.ADDR = learned_addr
+            changed = true
+        end
+        if config.TYPE ~= learned_type then
+            config.TYPE = learned_type
+            changed = true
+        end
+
+        if changed then
+            config.save()
+        end
+    end
+end
+
 
 -- [[ 内部逻辑：静默刷新 GPS 缓存 ]]
 local function update_gps_cache()
@@ -125,12 +150,18 @@ local function handle_sa_command(sock, frame)
                             modified = true
                         end
                     elseif source_map.ID then
-                        local grabbed_addr = string.match(source_map.ID, "(%d+)")
-                        if grabbed_addr then
-                            local new_addr = tonumber(grabbed_addr)
+                        local type_part, addr_part = string.match(source_map.ID, "([A-Z]*)(%d+)")
+                        if addr_part then
+                            local new_addr = tonumber(addr_part)
+                            local new_type = (type_part ~= "") and type_part or "TY"
                             if config.ADDR ~= new_addr then
                                 config.ADDR = new_addr
-                                log.info("APP", frame.cmd .. " Success: Local ADDR (from ID) updated to " .. config.ADDR)
+                                log.info("APP", frame.cmd .. " Success: Local ADDR updated to " .. config.ADDR)
+                                modified = true
+                            end
+                            if config.TYPE ~= new_type then
+                                config.TYPE = new_type
+                                log.info("APP", frame.cmd .. " Success: Local TYPE updated to " .. config.TYPE)
                                 modified = true
                             end
                         end
@@ -425,15 +456,8 @@ local function uart_task()
                     local mcu_mid, mcu_type, mcu_cmd, mcu_payload = p6[3], p6[4], p6[5], p6[6]
                     last_mcu_alive = true
                     
-                    -- 【动态认主】截获单片机主动吐出的 ID（例如 5）并纠正自己的认知
-                    local learned_addr = string.match(mcu_payload, "ID=(%d+)")
-                    if learned_addr then 
-                        local learned = tonumber(learned_addr)
-                        if config.ADDR ~= learned then
-                            config.ADDR = learned
-                            config.save()
-                        end
-                    end
+                    -- 【动态认主】截获单片机主动吐出的 ID 前缀与数字（例如 FJ5 或 TY5）并同步认知
+                    sync_mcu_identity(mcu_payload)
                     
                     if mcu_cmd == "MR" then
                         local current_devid = get_device_id()
