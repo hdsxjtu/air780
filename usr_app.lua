@@ -240,27 +240,7 @@ local function handle_sa_command(sock, frame)
         else
             log.warn("APP", "[FD] Missing url in payload")
             proto.as_tx(sock, frame.id, "RSP", "FD",
-                "ID=" .. current_devid .. ";ack=" .. proto.ACK_ERROR .. ";status=missing_url")
-        end
-
-    -- ----------------------------------------------------------------
-    -- FU: Firmware Upgrade — 自动让MCU进入BOOT模式后刷写
-    -- 自动发送 BOOT → MCU复位 → Bootloader 救砖模式 → OU/OD/OE
-    -- 服务端发: SA,1,XXXX,CMD,FU,ID=1
-    -- ----------------------------------------------------------------
-    elseif frame.cmd == "FU" then
-        log.info("APP", "[FU] Starting MCU flash from local firmware")
-        proto.as_tx(sock, frame.id, "RSP", "FU",
-            "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=flashing")
-        sys.taskInit(function()
-            last_ota_mid = frame.id
-            last_ota_cmd = "FU"
-            sys.wait(500)
-            local ok = ota.flash(last_mcu_fw_crc)
-            -- 结果由 FOTA_STATE 事件回调上报
-        end)
-
-    -- ----------------------------------------------------------------
+                    -- ----------------------------------------------------------------
     -- OU: 4G模组自身FOTA（保留旧功能，target=4g）
     -- ----------------------------------------------------------------
     elseif frame.cmd == "OU" then
@@ -279,6 +259,9 @@ local function handle_sa_command(sock, frame)
             proto.as_tx(sock, frame.id, "RSP", "OU",
                 "ID=" .. current_devid .. ";ack=" .. proto.ACK_ERROR)
         end
+    elseif frame.cmd == "TS" then
+        sys.publish("SERVER_TS_OK")
+        log.info("APP", "TS sync response received from server!")
     end
     mcu_is_busy = false
 end
@@ -293,7 +276,25 @@ local function network_task()
         if socket.localIP() == "0.0.0.0" or socket.localIP() == nil then
             sys.waitUntil("IP_READY")
         end
-        log.info("NET", "Connecting to server: " .. config.SERVER_IP .. ":" .. config.SERVER_PORT)
+
+        local target_ip = config.SERVER_IP
+        local target_port = config.SERVER_PORT
+        
+        -- 判断是否有自定义 IP 配置 (5 数字均不为 0 则判定为自定义配置)
+        local is_custom_ip = (config.SIP1 and config.SIP1 ~= 0) or 
+                             (config.SIP2 and config.SIP2 ~= 0) or 
+                             (config.SIP3 and config.SIP3 ~= 0) or 
+                             (config.SIP4 and config.SIP4 ~= 0)
+                             
+        if is_custom_ip then
+            target_ip = string.format("%d.%d.%d.%d", config.SIP1 or 0, config.SIP2 or 0, config.SIP3 or 0, config.SIP4 or 0)
+            target_port = config.SPT or 5555
+        else
+            target_ip = "frp-arm.com"
+            target_port = 36297
+        end
+
+        log.info("NET", "Connecting to server: " .. target_ip .. ":" .. tostring(target_port))
         
         local rxbuff = zbuff.create(1024)
         netc = socket.create(nil, function(sc, event)
@@ -322,11 +323,55 @@ local function network_task()
         end)
         
         socket.config(netc, nil, true)
-
-        if socket.connect(netc, config.SERVER_IP, config.SERVER_PORT) then
+ 
+        if socket.connect(netc, target_ip, target_port) then
             -- 成功连接服务器
             proto.set_debug_socket(netc)
             sys.publish("SOCKET_CONNECTED")
+
+            if is_custom_ip then
+                -- 启动连通性探测协程
+                sys.taskInit(function()
+                    local current_devid = get_device_id()
+                    local success = false
+                    log.info("NET_PROBE", "Custom IP detected, starting TS probe...")
+                    
+                    for retry = 1, 3 do
+                        sys.wait(1000) -- 给套接字连接稍微留出建立缓冲时间
+                        local ts_mid = proto.next_id()
+                        log.info("NET_PROBE", "Send TS probe frame, try: " .. retry)
+                        proto.as_tx(netc, ts_mid, "CMD", "TS", "ID=" .. current_devid)
+                        
+                        -- 等待服务器回复 RSP,TS，超时 5000ms
+                        local ok = sys.waitUntil("SERVER_TS_OK", 5000)
+                        if ok then
+                            log.info("NET_PROBE", "TS probe success! Link locked.")
+                            success = true
+                            break
+                        else
+                            log.warn("NET_PROBE", "TS probe timeout for try: " .. retry)
+                        end
+                    end
+                    
+                    if not success then
+                        log.error("NET_PROBE", "TS probe failed 3 times! Falling back to 0.0.0.0...")
+                        -- 1. 重置 4G 本地参数为 0
+                        config.SIP1 = 0
+                        config.SIP2 = 0
+                        config.SIP3 = 0
+                        config.SIP4 = 0
+                        config.SPT  = 0
+                        config.save()
+                        
+                        -- 2. 推送串口指令给单片机，把单片机的 IP/Port 也刷为 0
+                        proto.am_tx("0000", "CMD", "CS", "ID=" .. current_devid .. ";SIP1=0;SIP2=0;SIP3=0;SIP4=0;SPT=0")
+                        
+                        -- 3. 强行关闭 Socket 触发 network_task 重新拨号 fallback
+                        sys.publish("SOCKET_CLOSED")
+                    end
+                end)
+            end
+
             sys.waitUntil("SOCKET_CLOSED", 86400000)
         else
             sys.wait(5000)

@@ -27,6 +27,11 @@ config.NAT_INTERVAL    = 30 * 1000       -- 【防断连】缩短到 30 秒以�
 config.REPORT_INTERVAL    = 60 * 60 * 1000 -- 【重量】定时采样间隔 (ms)，对应协议中的 RPT 参数。
 config.ADDR               = 1              -- 【配置】设备物理地址（site_id），与单片机同步。
 config.TYPE               = "TY"           -- 【配置】设备类型前缀 ("TY" or "FJ")，自动同步自 MCU。
+config.SIP1               = 0              -- 【配置】服务器 IP 第 1 段
+config.SIP2               = 0              -- 【配置】服务器 IP 第 2 段
+config.SIP3               = 0              -- 【配置】服务器 IP 第 3 段
+config.SIP4               = 0              -- 【配置】服务器 IP 第 4 段
+config.SPT                = 0              -- 【配置】服务器端口号
 config.LBS_TIMEOUT        = 30000          -- LBS 定位超时
 
 local CONFIG_FILE = "/usr_config.json"
@@ -34,10 +39,13 @@ local CONFIG_FILE = "/usr_config.json"
 function config.save()
     local f = io.open(CONFIG_FILE, "w")
     if f then
-        f:write(string.format('{"ADDR":%d,"REPORT_INTERVAL":%d,"TYPE":"%s","LAT":"%s","LNG":"%s"}', 
-            config.ADDR or 1, config.REPORT_INTERVAL or (60 * 60 * 1000), config.TYPE or "TY", config.LAT or "", config.LNG or ""))
+        f:write(string.format('{"ADDR":%d,"REPORT_INTERVAL":%d,"TYPE":"%s","LAT":"%s","LNG":"%s","SIP1":%d,"SIP2":%d,"SIP3":%d,"SIP4":%d,"SPT":%d}', 
+            config.ADDR or 1, config.REPORT_INTERVAL or (60 * 60 * 1000), config.TYPE or "TY", config.LAT or "", config.LNG or "",
+            config.SIP1 or 0, config.SIP2 or 0, config.SIP3 or 0, config.SIP4 or 0, config.SPT or 0))
         f:close()
-        log.info("CONFIG", "Saved local config: ADDR=" .. tostring(config.ADDR) .. ", TYPE=" .. tostring(config.TYPE) .. ", RPT=" .. tostring(config.REPORT_INTERVAL) .. ", LAT=" .. tostring(config.LAT) .. ", LNG=" .. tostring(config.LNG))
+        log.info("CONFIG", string.format("Saved local config: ADDR=%s, TYPE=%s, RPT=%s, IP=%d.%d.%d.%d:%d", 
+            tostring(config.ADDR), tostring(config.TYPE), tostring(config.REPORT_INTERVAL),
+            config.SIP1 or 0, config.SIP2 or 0, config.SIP3 or 0, config.SIP4 or 0, config.SPT or 0))
         return true
     end
     return false
@@ -57,22 +65,26 @@ function config.load()
         local dev_type = string.match(content, '"TYPE":"(.-)"')
         local lat = string.match(content, '"LAT":"(.-)"')
         local lng = string.match(content, '"LNG":"(.-)"')
-        if addr then
-            config.ADDR = tonumber(addr)
-        end
-        if rpt then
-            config.REPORT_INTERVAL = tonumber(rpt)
-        end
-        if dev_type and dev_type ~= "" then
-            config.TYPE = dev_type
-        end
-        if lat and lat ~= "" then
-            config.LAT = lat
-        end
-        if lng and lng ~= "" then
-            config.LNG = lng
-        end
-        log.info("CONFIG", "Loaded saved config: ADDR=" .. tostring(config.ADDR) .. ", TYPE=" .. tostring(config.TYPE) .. ", RPT=" .. tostring(config.REPORT_INTERVAL) .. ", LAT=" .. tostring(config.LAT) .. ", LNG=" .. tostring(config.LNG))
+        local sip1 = string.match(content, '"SIP1":(%d+)')
+        local sip2 = string.match(content, '"SIP2":(%d+)')
+        local sip3 = string.match(content, '"SIP3":(%d+)')
+        local sip4 = string.match(content, '"SIP4":(%d+)')
+        local spt = string.match(content, '"SPT":(%d+)')
+        
+        if addr then config.ADDR = tonumber(addr) end
+        if rpt then config.REPORT_INTERVAL = tonumber(rpt) end
+        if dev_type and dev_type ~= "" then config.TYPE = dev_type end
+        if lat and lat ~= "" then config.LAT = lat end
+        if lng and lng ~= "" then config.LNG = lng end
+        if sip1 then config.SIP1 = tonumber(sip1) end
+        if sip2 then config.SIP2 = tonumber(sip2) end
+        if sip3 then config.SIP3 = tonumber(sip3) end
+        if sip4 then config.SIP4 = tonumber(sip4) end
+        if spt then config.SPT = tonumber(spt) end
+        
+        log.info("CONFIG", string.format("Loaded saved config: ADDR=%s, TYPE=%s, RPT=%s, IP=%d.%d.%d.%d:%d", 
+            tostring(config.ADDR), tostring(config.TYPE), tostring(config.REPORT_INTERVAL),
+            config.SIP1 or 0, config.SIP2 or 0, config.SIP3 or 0, config.SIP4 or 0, config.SPT or 0))
         return true
     end
     return false
