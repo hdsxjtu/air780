@@ -59,6 +59,29 @@ local function sync_mcu_identity(mcu_payload)
     end
 end
 
+-- [[ 新增：解析并同步 IP/Port 配置，若有变化则重连新 IP ]]
+local function sync_ip_port(payload_map)
+    if not payload_map then return end
+    if payload_map.SIP1 or payload_map.SIP2 or payload_map.SIP3 or payload_map.SIP4 or payload_map.SPT then
+        local s1 = tonumber(payload_map.SIP1) or config.SIP1 or 0
+        local s2 = tonumber(payload_map.SIP2) or config.SIP2 or 0
+        local s3 = tonumber(payload_map.SIP3) or config.SIP3 or 0
+        local s4 = tonumber(payload_map.SIP4) or config.SIP4 or 0
+        local spt = tonumber(payload_map.SPT) or config.SPT or 5555
+        
+        if config.SIP1 ~= s1 or config.SIP2 ~= s2 or config.SIP3 ~= s3 or config.SIP4 ~= s4 or config.SPT ~= spt then
+            config.SIP1 = s1
+            config.SIP2 = s2
+            config.SIP3 = s3
+            config.SIP4 = s4
+            config.SPT  = spt
+            config.save()
+            log.info("APP", "IP/Port updated, reconnecting to new server: " .. string.format("%d.%d.%d.%d:%d", s1, s2, s3, s4, spt))
+            sys.publish("SOCKET_CLOSED")
+        end
+    end
+end
+
 
 -- [[ 内部逻辑：静默刷新 GPS 缓存 ]]
 local function update_gps_cache()
@@ -166,6 +189,9 @@ local function handle_sa_command(sock, frame)
                             end
                         end
                     end
+                    -- 同步自定义 IP & Port
+                    sync_ip_port(source_map)
+
                     if modified then
                         config.save()
                     end
@@ -240,7 +266,25 @@ local function handle_sa_command(sock, frame)
         else
             log.warn("APP", "[FD] Missing url in payload")
             proto.as_tx(sock, frame.id, "RSP", "FD",
-                    -- ----------------------------------------------------------------
+                "ID=" .. current_devid .. ";ack=" .. proto.ACK_ERROR)
+        end
+    -- ----------------------------------------------------------------
+    -- FU: Firmware Upgrade — 自动让MCU进入BOOT模式后刷写
+    -- 自动发送 BOOT → MCU复位 → Bootloader 救砖模式 → OU/OD/OE
+    -- 服务端发: SA,1,XXXX,CMD,FU,ID=1
+    -- ----------------------------------------------------------------
+    elseif frame.cmd == "FU" then
+        log.info("APP", "[FU] Starting MCU flash from local firmware")
+        proto.as_tx(sock, frame.id, "RSP", "FU",
+            "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=flashing")
+        sys.taskInit(function()
+            last_ota_mid = frame.id
+            last_ota_cmd = "FU"
+            sys.wait(500)
+            local ok = ota.flash(last_mcu_fw_crc)
+            -- 结果由 FOTA_STATE 事件回调上报
+        end)
+    -- ----------------------------------------------------------------
     -- OU: 4G模组自身FOTA（保留旧功能，target=4g）
     -- ----------------------------------------------------------------
     elseif frame.cmd == "OU" then
@@ -307,10 +351,15 @@ local function network_task()
                     if ok and len and len > 0 then
                         local data = rxbuff:toStr(0, len)
                         log.info("UDP_RX", "Drained Packet: " .. data)
-                        local frame = proto.parse_sa_frame(data)
-                        if frame then
-                            table.insert(sa_cmd_queue, frame)
-                            sys.publish("SA_QUEUE_READY")
+                        if string.find(data, ",RSP,TS") then
+                            sys.publish("SERVER_TS_OK")
+                            log.info("NET_PROBE", "TS Response intercepted successfully!")
+                        else
+                            local frame = proto.parse_sa_frame(data)
+                            if frame then
+                                table.insert(sa_cmd_queue, frame)
+                                sys.publish("SA_QUEUE_READY")
+                            end
                         end
                     else
                         break
@@ -355,16 +404,16 @@ local function network_task()
                     
                     if not success then
                         log.error("NET_PROBE", "TS probe failed 3 times! Falling back to 0.0.0.0...")
-                        -- 1. 重置 4G 本地参数为 0
+                        -- 1. 重置 4G 本地参数为 IP=0.0.0.0, Port=5555
                         config.SIP1 = 0
                         config.SIP2 = 0
                         config.SIP3 = 0
                         config.SIP4 = 0
-                        config.SPT  = 0
+                        config.SPT  = 5555
                         config.save()
                         
-                        -- 2. 推送串口指令给单片机，把单片机的 IP/Port 也刷为 0
-                        proto.am_tx("0000", "CMD", "CS", "ID=" .. current_devid .. ";SIP1=0;SIP2=0;SIP3=0;SIP4=0;SPT=0")
+                        -- 2. 推送串口指令给单片机，把单片机的 IP 刷为 0，端口刷为 5555
+                        proto.am_tx("0000", "CMD", "CS", "ID=" .. current_devid .. ";SIP1=0;SIP2=0;SIP3=0;SIP4=0;SPT=5555")
                         
                         -- 3. 强行关闭 Socket 触发 network_task 重新拨号 fallback
                         sys.publish("SOCKET_CLOSED")
@@ -512,6 +561,13 @@ local function uart_task()
                         if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
                         proto.am_tx(mcu_mid, "ACK", "MR", "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS)
+                    elseif mcu_cmd == "CG" then
+                        proto.as_tx(netc, mcu_mid, mcu_type, "CG", mcu_payload)
+                        if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
+                        
+                        -- 解析并同步 IP/Port 参数以触发连接重拨
+                        local mcu_map = proto.parse_payload(mcu_payload)
+                        sync_ip_port(mcu_map)
                     end
                 end
             end
