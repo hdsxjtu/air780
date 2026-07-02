@@ -198,11 +198,12 @@ local function handle_sa_command(sock, frame)
                 end
             end
 
-            local final_payload = mcu_payload
-            if frame.cmd == "CG" or frame.cmd == "CS" then
-                final_payload = string.gsub(mcu_payload, "(ID=[^;]+;)", "%1gv=4G" .. _G.VERSION .. ";")
+            -- CG: 不在此处转发，由 uart_task 作为唯一出口并注入 gv
+            -- CS: MCU 的 ack 需要返回给服务器，在此统一转发
+            if frame.cmd == "CS" then
+                local final_payload = string.gsub(mcu_payload, "(ID=[^;]+;)", "%1gv=4G" .. _G.VERSION .. ";")
+                proto.as_tx(sock, frame.id, "RSP", "CS", final_payload)
             end
-            proto.as_tx(sock, frame.id, "RSP", frame.cmd, final_payload)
         else
             last_mcu_alive = false
             proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
@@ -562,7 +563,9 @@ local function uart_task()
                         
                         proto.am_tx(mcu_mid, "ACK", "MR", "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS)
                     elseif mcu_cmd == "CG" then
-                        proto.as_tx(netc, mcu_mid, mcu_type, "CG", mcu_payload)
+                        -- 统一注入 gv，作为 CG 帧的唯一转发出口（包括 MCU 主动上报和响应服务器指令两种情况）
+                        local final_cg = string.gsub(mcu_payload, "(ID=[^;]+;)", "%1gv=4G" .. _G.VERSION .. ";")
+                        proto.as_tx(netc, mcu_mid, mcu_type, "CG", final_cg)
                         if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
                         -- 解析并同步 IP/Port 参数以触发连接重拨
