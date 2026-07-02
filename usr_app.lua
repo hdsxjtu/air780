@@ -420,6 +420,15 @@ local function network_task()
                         sys.publish("SOCKET_CLOSED")
                     end
                 end)
+            else
+                -- 默认服务器连接成功，发送单次 TS 帧进行测试/校对时间（不带失败回退逻辑）
+                sys.taskInit(function()
+                    sys.wait(1000)
+                    local current_devid = get_device_id()
+                    local ts_mid = proto.next_id()
+                    log.info("NET_PROBE", "Send default server TS test frame...")
+                    proto.as_tx(netc, ts_mid, "CMD", "TS", "ID=" .. current_devid)
+                end)
             end
 
             sys.waitUntil("SOCKET_CLOSED", 86400000)
