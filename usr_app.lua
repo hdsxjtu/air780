@@ -32,16 +32,28 @@ local function get_device_id()
     if config.DEVICE_ID then
         return config.DEVICE_ID
     end
-    return tostring(config.TYPE or "TY") .. tostring(config.ADDR or "1")
+    return tostring(config.ADDR or "1")
+end
+
+local function get_device_type()
+    return tostring(config.TYPE or "TY")
+end
+
+local function id_matches_local(payload_id, current_devid)
+    if payload_id == current_devid then
+        return true
+    end
+    return payload_id == (get_device_type() .. current_devid)
 end
 
 -- [[ 新增：解析 MCU 帧动态纠正本地 ID 认知 ]]
 local function sync_mcu_identity(mcu_payload)
     if not mcu_payload then return end
+    local explicit_type = string.match(mcu_payload, "TYPE=([A-Z]+)")
     local type_part, addr_part = string.match(mcu_payload, "ID=([A-Z]*)(%d+)")
     if addr_part then
         local learned_addr = tonumber(addr_part)
-        local learned_type = (type_part ~= "") and type_part or "TY"
+        local learned_type = explicit_type or ((type_part ~= "") and type_part or config.TYPE or "TY")
         local changed = false
 
         if config.ADDR ~= learned_addr then
@@ -116,16 +128,16 @@ local function handle_sa_command(sock, frame)
 
     -- 1. 严格 ID 校验和 IMEI 校验 (强制要求指令必须携带 IMEI 且完全匹配，防重名风险)
     local local_imei = mobile and mobile.imei and mobile.imei() or ""
-    if not payload_map.ID or payload_map.ID ~= current_devid or not payload_map.imei or payload_map.imei ~= local_imei then
+    if not payload_map.ID or not id_matches_local(payload_map.ID, current_devid) or not payload_map.imei or payload_map.imei ~= local_imei then
         log.error("APP", "ID/IMEI Mismatch: expected " .. current_devid .. "/" .. local_imei .. " but got " .. tostring(payload_map.ID) .. "/" .. tostring(payload_map.imei))
-        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_ID_MISMATCH) 
+        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_ID_MISMATCH) 
         return 
     end
     
     -- 2. 模组忙阻判定
     if not boot_synced or mcu_is_busy then
         log.warn("APP", "System Startup/Busy, rejecting SA command: " .. (frame.id or "N/A"))
-        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_BUSY)
+        proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_BUSY)
         return
     end
 
@@ -172,11 +184,12 @@ local function handle_sa_command(sock, frame)
                             log.info("APP", frame.cmd .. " Success: Local ADDR updated to " .. config.ADDR)
                             modified = true
                         end
-                    elseif source_map.ID then
+                    end
+                    if source_map.ID then
                         local type_part, addr_part = string.match(source_map.ID, "([A-Z]*)(%d+)")
                         if addr_part then
                             local new_addr = tonumber(addr_part)
-                            local new_type = (type_part ~= "") and type_part or "TY"
+                            local new_type = source_map.TYPE or ((type_part ~= "") and type_part or config.TYPE or "TY")
                             if config.ADDR ~= new_addr then
                                 config.ADDR = new_addr
                                 log.info("APP", frame.cmd .. " Success: Local ADDR updated to " .. config.ADDR)
@@ -188,6 +201,11 @@ local function handle_sa_command(sock, frame)
                                 modified = true
                             end
                         end
+                    end
+                    if source_map.TYPE and config.TYPE ~= source_map.TYPE then
+                        config.TYPE = source_map.TYPE
+                        log.info("APP", frame.cmd .. " Success: Local TYPE updated to " .. config.TYPE)
+                        modified = true
                     end
                     -- 同步自定义 IP & Port
                     sync_ip_port(source_map)
@@ -206,7 +224,7 @@ local function handle_sa_command(sock, frame)
             end
         else
             last_mcu_alive = false
-            proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
+            proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
         end
 
     -- 针对 MS/MG 指令的处理 (二阶段 ACK)
@@ -220,18 +238,18 @@ local function handle_sa_command(sock, frame)
             local mcu_ack = mcu_payload.ack or "0"
             last_mcu_alive = true
             
-            proto.as_tx(sock, frame.id, mcu_type, frame.cmd, "ID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. mcu_ack)
+            proto.as_tx(sock, frame.id, mcu_type, frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. mcu_ack)
             
             if mcu_type == "ACK" and mcu_ack == proto.ACK_SUCCESS then
                 sys.publish("PENDING_SERVER_MID", frame.id)
             end
         else
             last_mcu_alive = false
-            proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
+            proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
         end
     elseif frame.cmd == "MD" then
         -- 1. 立即回复一阶段 ACK，防止服务器超时
-        proto.as_tx(sock, frame.id, "ACK", "MD", "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS)
+        proto.as_tx(sock, frame.id, "ACK", "MD", "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS)
         
         -- 2. 启动异步后台定位并在完成后上报 RSP
         sys.taskInit(function()
@@ -246,7 +264,7 @@ local function handle_sa_command(sock, frame)
                 report_lat = last_lat or "-1"
                 report_lng = last_lng or "-1"
             end
-            proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, last_mcu_alive, report_lat, report_lng))
+            proto.as_tx(sock, frame.id, "RSP", "MD", proto.modem_payload(current_devid, get_device_type(), last_mcu_alive, report_lat, report_lng))
         end)
     -- ----------------------------------------------------------------
     -- FD: Firmware Download — 强制下载固件到4G模组本地，不碰单片机
@@ -256,7 +274,7 @@ local function handle_sa_command(sock, frame)
         if payload_map.url then
             log.info("APP", "[FD] URL: " .. payload_map.url .. " size=" .. tostring(payload_map.size) .. " crc=" .. tostring(payload_map.crc))
             proto.as_tx(sock, frame.id, "RSP", "FD",
-                "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=downloading")
+                "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS .. ";status=downloading")
             sys.taskInit(function()
                 last_ota_mid = frame.id
                 last_ota_cmd = "FD"
@@ -267,7 +285,7 @@ local function handle_sa_command(sock, frame)
         else
             log.warn("APP", "[FD] Missing url in payload")
             proto.as_tx(sock, frame.id, "RSP", "FD",
-                "ID=" .. current_devid .. ";ack=" .. proto.ACK_ERROR)
+                "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_ERROR)
         end
     -- ----------------------------------------------------------------
     -- FU: Firmware Upgrade — 自动让MCU进入BOOT模式后刷写
@@ -277,7 +295,7 @@ local function handle_sa_command(sock, frame)
     elseif frame.cmd == "FU" then
         log.info("APP", "[FU] Starting MCU flash from local firmware")
         proto.as_tx(sock, frame.id, "RSP", "FU",
-            "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=flashing")
+            "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS .. ";status=flashing")
         sys.taskInit(function()
             last_ota_mid = frame.id
             last_ota_cmd = "FU"
@@ -292,7 +310,7 @@ local function handle_sa_command(sock, frame)
         if payload_map.url then
             log.info("APP", "[OU] 4G FOTA URL: " .. payload_map.url)
             proto.as_tx(sock, frame.id, "RSP", "OU",
-                "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=downloading")
+                "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS .. ";status=downloading")
             sys.taskInit(function()
                 last_ota_mid = frame.id
                 last_ota_cmd = "OU"
@@ -302,7 +320,7 @@ local function handle_sa_command(sock, frame)
         else
             log.warn("APP", "[OU] Missing url in payload")
             proto.as_tx(sock, frame.id, "RSP", "OU",
-                "ID=" .. current_devid .. ";ack=" .. proto.ACK_ERROR)
+                "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_ERROR)
         end
     elseif frame.cmd == "TS" then
         sys.publish("SERVER_TS_OK")
@@ -390,7 +408,7 @@ local function network_task()
                         sys.wait(1000) -- 给套接字连接稍微留出建立缓冲时间
                         local ts_mid = proto.next_id()
                         log.info("NET_PROBE", "Send TS probe frame, try: " .. retry)
-                        proto.as_tx(netc, ts_mid, "CMD", "TS", "ID=" .. current_devid)
+                        proto.as_tx(netc, ts_mid, "CMD", "TS", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
                         
                         -- 等待服务器回复 RSP,TS，超时 5000ms
                         local ok = sys.waitUntil("SERVER_TS_OK", 5000)
@@ -427,7 +445,7 @@ local function network_task()
                     local current_devid = get_device_id()
                     local ts_mid = proto.next_id()
                     log.info("NET_PROBE", "Send default server TS test frame...")
-                    proto.as_tx(netc, ts_mid, "CMD", "TS", "ID=" .. current_devid)
+                    proto.as_tx(netc, ts_mid, "CMD", "TS", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
                 end)
             end
 
@@ -465,12 +483,17 @@ local function timer_task()
         if mcu_map.ADDR then
             config.ADDR = tonumber(mcu_map.ADDR)
             modified = true
-        elseif mcu_map.ID then
+        end
+        if mcu_map.ID then
             local grabbed_addr = string.match(mcu_map.ID, "(%d+)")
             if grabbed_addr then
                 config.ADDR = tonumber(grabbed_addr)
                 modified = true
             end
+        end
+        if mcu_map.TYPE and config.TYPE ~= mcu_map.TYPE then
+            config.TYPE = mcu_map.TYPE
+            modified = true
         end
         if mcu_map.RPT then
             config.REPORT_INTERVAL = tonumber(mcu_map.RPT) * 60 * 1000
@@ -509,7 +532,7 @@ local function timer_task()
 
         if not last_mcu_alive then
             log.error("CYCLE", "MCU Offline! Report EVT,MD")
-            proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, false, last_lat, last_lng))
+            proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, get_device_type(), false, last_lat, last_lng))
             if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
         end
         -- 注意：如果单片机在线，它随后会通过串口主动上报 MR 帧，
@@ -538,7 +561,7 @@ local function heartbeat_task()
             if elapsed >= interval then
                 -- 升级为标准 AS 协议帧心跳，确保全链路报文格式统一
                 local current_devid = get_device_id()
-                proto.as_tx(netc, proto.next_id(), "EVT", "HB", "ID=" .. current_devid)
+                proto.as_tx(netc, proto.next_id(), "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
                 
                 -- 发送完数据后立即请求释放 RRC 连接，回到浅休眠状态
                 if mobile and mobile.rrcRelease then
@@ -570,7 +593,7 @@ local function uart_task()
                         proto.as_tx(netc, mcu_mid, mcu_type, "MR", final_payload)
                         if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
-                        proto.am_tx(mcu_mid, "ACK", "MR", "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS)
+                        proto.am_tx(mcu_mid, "ACK", "MR", "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS)
                     elseif mcu_cmd == "CG" then
                         -- 统一注入 gv，作为 CG 帧的唯一转发出口（包括 MCU 主动上报和响应服务器指令两种情况）
                         local final_cg = string.gsub(mcu_payload, "(ID=[^;]+;)", "%1gv=4G" .. _G.VERSION .. ";")
@@ -622,7 +645,7 @@ sys.subscribe("FOTA_STATE", function(status_name, result)
         if status_name == "fu_progress" then
             status_str = "flashing_" .. tostring(result) .. "%"
         end
-        local payload = "ID=" .. current_devid .. ";ack=" .. proto.ACK_SUCCESS .. ";status=" .. status_str
+        local payload = "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS .. ";status=" .. status_str
         if status_name == "fd_ok" and type(result) == "table" then
             -- CRC 转 uint32 十六进制显示 (兼容负数)
             local crc_u32 = result.crc

@@ -109,13 +109,13 @@ function proto.as_tx(sock, mid, frame_type, cmd, payload)
 end
 
 -- 构建模组状态 (MD) 的载荷部分
-function proto.modem_payload(imei, mcu_alive, lat, lng)
+function proto.modem_payload(device_id, device_type, mcu_alive, lat, lng)
     local rsrp = -99
     if mobile and mobile.rsrp then
         rsrp = mobile.rsrp()
     end
     local mdead = mcu_alive and "0" or "1"
-    local payload = "ID=" .. imei .. ";gv=4G" .. _G.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
+    local payload = "ID=" .. device_id .. ";TYPE=" .. device_type .. ";gv=4G" .. _G.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
     if lat and lng then
         payload = payload .. ";lat=" .. lat .. ";lng=" .. lng
     end
