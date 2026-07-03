@@ -164,13 +164,12 @@ function proto.request_mcu(mid, cmd, payload, timeout_ms, retries)
         end)
         
         if resp then
-            -- 检查响应中如果包含 ack 字段，必须为 ack=1 (ACK_SUCCESS) 才算成功
+            -- Matched MID/CMD means MCU replied; let upper layer handle ack value.
             if string.find(resp, "ack=") and not string.find(resp, "ack=1") then
                 log.warn("PROTO", "MCU Replied non-success ACK: " .. resp)
-            else
-                -- proto.trace_to_server("RX", cmd, resp)
-                return resp -- 成功拿到应答，直接返回
             end
+            -- proto.trace_to_server("RX", cmd, resp)
+            return resp
         end
         -- proto.trace_to_server("TIMEOUT", cmd, "Attempt " .. i .. " failed")
         log.warn("PROTO", "MCU Request Timeout: " .. cmd .. " (Attempt " .. i .. " failed)")
