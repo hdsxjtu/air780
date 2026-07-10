@@ -22,7 +22,7 @@ config.UART_BAUD       = 9600 -- 9600波特率可唤醒MCU的LPUART Stop模式
 -- Power Management
 -- 0: Normal(全速)  1: Light Sleep(轻度休眠，网络保持在线，可远程唤醒)
 -- 2: Balanced      3: PSM Deep Sleep(深度休眠，网络断开，无法远程唤醒)
-config.POWER_MODE      = 0 -- 请切换为 1 进行测试
+config.POWER_MODE      = 1 -- Light Sleep: 网络保持在线，降低空闲功耗
 config.NAT_INTERVAL    = 10 * 60 * 1000  -- 【防断连】测试用 10 分钟心跳，降低常驻功耗
 config.REPORT_INTERVAL    = 60 * 60 * 1000 -- 【重量】定时采样间隔 (ms)，对应协议中的 RPT 参数。
 config.ADDR               = 1              -- 【配置】设备物理地址（site_id），与单片机同步。
