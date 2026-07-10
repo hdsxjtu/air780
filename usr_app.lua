@@ -556,7 +556,7 @@ local function heartbeat_task()
         if netc then
             local now = os.time()
             local elapsed = now - (proto.last_tx_time or 0)
-            local interval = (config.NAT_INTERVAL and config.NAT_INTERVAL > 0) and (config.NAT_INTERVAL / 1000) or 120
+            local interval = (config.NAT_INTERVAL and config.NAT_INTERVAL > 0) and (config.NAT_INTERVAL / 1000) or 600
             
             if elapsed >= interval then
                 -- 升级为标准 AS 协议帧心跳，确保全链路报文格式统一
