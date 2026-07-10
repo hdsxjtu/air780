@@ -552,7 +552,6 @@ local function heartbeat_task()
     sys.waitUntil("BOOT_SYNC_DONE")
     
     while true do
-        sys.wait(1000) -- 每 1 秒检查一次
         if netc then
             local now = os.time()
             local elapsed = now - (proto.last_tx_time or 0)
@@ -567,7 +566,11 @@ local function heartbeat_task()
                 if mobile and mobile.rrcRelease then
                     mobile.rrcRelease(true)
                 end
+            else
+                sys.wait((interval - elapsed) * 1000)
             end
+        else
+            sys.wait(60000)
         end
     end
 end
