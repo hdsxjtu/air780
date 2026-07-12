@@ -22,8 +22,20 @@ config.UART_BAUD       = 9600 -- 9600波特率可唤醒MCU的LPUART Stop模式
 -- Power Management
 -- 0: Normal(全速)  1: Light Sleep(轻度休眠，网络保持在线，可远程唤醒)
 -- 2: Balanced      3: PSM Deep Sleep(深度休眠，网络断开，无法远程唤醒)
-config.POWER_MODE      = 1 -- Light Sleep: 网络保持在线，降低空闲功耗
-config.NAT_INTERVAL    = 10 * 60 * 1000  -- 【防断连】测试用 10 分钟心跳，降低常驻功耗
+config.POWER_MODE      = 1              -- Light Sleep fallback; PSM+ mode is entered after report
+config.NETWORK_ENABLE  = true           -- true: enable cellular networking
+config.BOOT_HOLD_FLYMODE = true         -- hold flight mode early, then release before network start
+config.BOOT_NETWORK_DELAY_MS = 2000     -- configurable delay before 4G attach; default 2 seconds
+config.APPLY_EDRX_ON_BOOT = false       -- avoid forced flight-mode reconnect on every boot
+config.BOOT_LED_BLINK = false           -- configurable network-ready LED blink
+config.PSM_AFTER_REPORT = true          -- report once, then enter PSM+ until next dtimer wake
+config.REPORT_TX_WAIT_MS = 20000        -- wait for MCU MR upload before sleeping
+config.STARTUP_TS_PROBE = false         -- avoid extra UDP probe right after socket connect
+config.BOOT_MCU_SYNC_ENABLE = false     -- avoid CG sync at boot; server CG can still query later
+config.FIRST_REPORT_DELAY_MS = 0        -- network is already delayed before app.start()
+config.HEARTBEAT_START_DELAY_MS = 2 * 60 * 1000 -- delay first heartbeat after boot
+config.SERVER_CONNECT_DELAY_MS = 0      -- connect server immediately after delayed network attach
+config.NAT_INTERVAL    = 10 * 60 * 1000 -- lower heartbeat frequency for battery builds
 config.REPORT_INTERVAL    = 60 * 60 * 1000 -- 【重量】定时采样间隔 (ms)，对应协议中的 RPT 参数。
 config.ADDR               = 1              -- 【配置】设备物理地址（site_id），与单片机同步。
 config.TYPE               = "TY"           -- 【配置】设备类型前缀 ("TY" or "FJ")，自动同步自 MCU。
@@ -39,9 +51,10 @@ local CONFIG_FILE = "/usr_config.json"
 function config.save()
     local f = io.open(CONFIG_FILE, "w")
     if f then
-        f:write(string.format('{"ADDR":%d,"REPORT_INTERVAL":%d,"TYPE":"%s","LAT":"%s","LNG":"%s","SIP1":%d,"SIP2":%d,"SIP3":%d,"SIP4":%d,"SPT":%d}', 
+        f:write(string.format('{"ADDR":%d,"REPORT_INTERVAL":%d,"TYPE":"%s","LAT":"%s","LNG":"%s","SIP1":%d,"SIP2":%d,"SIP3":%d,"SIP4":%d,"SPT":%d,"BOOT_NETWORK_DELAY_MS":%d,"BOOT_LED_BLINK":%d}', 
             config.ADDR or 1, config.REPORT_INTERVAL or (60 * 60 * 1000), config.TYPE or "TY", config.LAT or "", config.LNG or "",
-            config.SIP1 or 0, config.SIP2 or 0, config.SIP3 or 0, config.SIP4 or 0, config.SPT or 0))
+            config.SIP1 or 0, config.SIP2 or 0, config.SIP3 or 0, config.SIP4 or 0, config.SPT or 0,
+            config.BOOT_NETWORK_DELAY_MS or 2000, config.BOOT_LED_BLINK and 1 or 0))
         f:close()
         log.info("CONFIG", string.format("Saved local config: ADDR=%s, TYPE=%s, RPT=%s, IP=%d.%d.%d.%d:%d", 
             tostring(config.ADDR), tostring(config.TYPE), tostring(config.REPORT_INTERVAL),
@@ -70,6 +83,8 @@ function config.load()
         local sip3 = string.match(content, '"SIP3":(%d+)')
         local sip4 = string.match(content, '"SIP4":(%d+)')
         local spt = string.match(content, '"SPT":(%d+)')
+        local boot_delay = string.match(content, '"BOOT_NETWORK_DELAY_MS":(%d+)')
+        local boot_led = string.match(content, '"BOOT_LED_BLINK":(%d+)')
         
         if addr then config.ADDR = tonumber(addr) end
         if rpt then config.REPORT_INTERVAL = tonumber(rpt) end
@@ -81,6 +96,8 @@ function config.load()
         if sip3 then config.SIP3 = tonumber(sip3) end
         if sip4 then config.SIP4 = tonumber(sip4) end
         if spt then config.SPT = tonumber(spt) end
+        if boot_delay then config.BOOT_NETWORK_DELAY_MS = tonumber(boot_delay) end
+        if boot_led then config.BOOT_LED_BLINK = (tonumber(boot_led) == 1) end
         
         log.info("CONFIG", string.format("Loaded saved config: ADDR=%s, TYPE=%s, RPT=%s, IP=%d.%d.%d.%d:%d", 
             tostring(config.ADDR), tostring(config.TYPE), tostring(config.REPORT_INTERVAL),

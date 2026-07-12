@@ -94,6 +94,38 @@ local function sync_ip_port(payload_map)
     end
 end
 
+local function parse_bool_flag(value)
+    if value == nil then return nil end
+    local s = string.lower(tostring(value))
+    if s == "1" or s == "true" or s == "on" or s == "yes" then return true end
+    if s == "0" or s == "false" or s == "off" or s == "no" then return false end
+    return nil
+end
+
+local function sync_power_params(payload_map)
+    if not payload_map then return false end
+    local modified = false
+
+    local delay_s = tonumber(payload_map.NDL or payload_map.NETD or payload_map.BOOTD)
+    if delay_s then
+        local delay_ms = math.max(0, math.min(delay_s, 300)) * 1000
+        if config.BOOT_NETWORK_DELAY_MS ~= delay_ms then
+            config.BOOT_NETWORK_DELAY_MS = delay_ms
+            modified = true
+            log.info("APP", "BOOT_NETWORK_DELAY_MS updated to " .. tostring(delay_ms))
+        end
+    end
+
+    local led_enabled = parse_bool_flag(payload_map.LED or payload_map.BLINK or payload_map.BLED)
+    if led_enabled ~= nil and config.BOOT_LED_BLINK ~= led_enabled then
+        config.BOOT_LED_BLINK = led_enabled
+        modified = true
+        log.info("APP", "BOOT_LED_BLINK updated to " .. tostring(led_enabled))
+    end
+
+    return modified
+end
+
 
 -- [[ 内部逻辑：静默刷新 GPS 缓存 ]]
 local function update_gps_cache()
@@ -209,6 +241,9 @@ local function handle_sa_command(sock, frame)
                     end
                     -- 同步自定义 IP & Port
                     sync_ip_port(source_map)
+                    if sync_power_params(source_map) then
+                        modified = true
+                    end
 
                     if modified then
                         config.save()
@@ -340,6 +375,14 @@ local function network_task()
             sys.waitUntil("IP_READY")
         end
 
+        if config.SERVER_CONNECT_DELAY_MS and config.SERVER_CONNECT_DELAY_MS > 0 then
+            log.info("NET", "Delay server connect: " .. tostring(config.SERVER_CONNECT_DELAY_MS) .. "ms")
+            if mobile and mobile.rrcRelease then
+                mobile.rrcRelease(true)
+            end
+            sys.wait(config.SERVER_CONNECT_DELAY_MS)
+        end
+
         local target_ip = config.SERVER_IP
         local target_port = config.SERVER_PORT
         
@@ -397,7 +440,7 @@ local function network_task()
             proto.set_debug_socket(netc)
             sys.publish("SOCKET_CONNECTED")
 
-            if is_custom_ip then
+            if is_custom_ip and config.STARTUP_TS_PROBE ~= false then
                 -- 启动连通性探测协程
                 sys.taskInit(function()
                     local current_devid = get_device_id()
@@ -438,7 +481,7 @@ local function network_task()
                         sys.publish("SOCKET_CLOSED")
                     end
                 end)
-            else
+            elseif config.STARTUP_TS_PROBE ~= false then
                 -- 默认服务器连接成功，发送单次 TS 帧进行测试/校对时间（不带失败回退逻辑）
                 sys.taskInit(function()
                     sys.wait(1000)
@@ -459,55 +502,85 @@ local function network_task()
 end
 
 -- [[ 任务 2：定时上报任务 ]]
+local function enter_psm_sleep(reason)
+    local sleep_ms = config.REPORT_INTERVAL or (60 * 60 * 1000)
+    log.info("PM", "Enter PSM+: " .. tostring(reason) .. ", wake in " .. tostring(sleep_ms) .. "ms")
+
+    if netc then
+        socket.close(netc)
+        netc = nil
+    end
+
+    if mobile and mobile.rrcRelease then
+        mobile.rrcRelease(true)
+    end
+
+    if pm.dtimerStart then
+        pm.dtimerStart(0, sleep_ms)
+    else
+        log.error("PM", "pm.dtimerStart unavailable, abort PSM+ to avoid no-wakeup sleep")
+        return
+    end
+
+    sys.wait(1000)
+    pm.power(pm.WORK_MODE, 3)
+end
+
 local function timer_task()
     -- 第一阶段：开机获取到网络，在 log 提示并闪烁指示灯 3 次，每次 100ms
     sys.waitUntil("SOCKET_CONNECTED")
     log.info("NET", "Network Ready. Connection established successfully!")
     
-    for i = 1, 3 do
-        led.on()
-        sys.wait(100)
-        led.off()
-        sys.wait(100)
+    if config.BOOT_LED_BLINK ~= false then
+        for i = 1, 3 do
+            led.on()
+            sys.wait(100)
+            led.off()
+            sys.wait(100)
+        end
     end
     sys.wait(5000)
     boot_synced = false
     -- 尝试温和同步一次单片机参数 (CG)
-    mcu_is_busy = true
     local current_devid = get_device_id()
-    local sync_line = proto.request_mcu(proto.next_id(), "CG", "ID=" .. current_devid, 1500, 1)
-    if sync_line then
-        local p6 = proto.split_n(sync_line, ",", 6)
-        local mcu_map = proto.parse_payload(p6[6])
-        local modified = false
-        if mcu_map.ADDR then
-            config.ADDR = tonumber(mcu_map.ADDR)
-            modified = true
-        end
-        if mcu_map.ID then
-            local grabbed_addr = string.match(mcu_map.ID, "(%d+)")
-            if grabbed_addr then
-                config.ADDR = tonumber(grabbed_addr)
+    if config.BOOT_MCU_SYNC_ENABLE ~= false then
+        mcu_is_busy = true
+        local sync_line = proto.request_mcu(proto.next_id(), "CG", "ID=" .. current_devid, 1500, 1)
+        if sync_line then
+            local p6 = proto.split_n(sync_line, ",", 6)
+            local mcu_map = proto.parse_payload(p6[6])
+            local modified = false
+            if mcu_map.ADDR then
+                config.ADDR = tonumber(mcu_map.ADDR)
                 modified = true
             end
+            if mcu_map.ID then
+                local grabbed_addr = string.match(mcu_map.ID, "(%d+)")
+                if grabbed_addr then
+                    config.ADDR = tonumber(grabbed_addr)
+                    modified = true
+                end
+            end
+            if mcu_map.TYPE and config.TYPE ~= mcu_map.TYPE then
+                config.TYPE = mcu_map.TYPE
+                modified = true
+            end
+            if mcu_map.RPT then
+                config.REPORT_INTERVAL = tonumber(mcu_map.RPT) * 60 * 1000
+                modified = true
+                sys.publish("REPORT_INTERVAL_UPDATED")
+            end
+            if modified then
+                config.save()
+            end
+            log.info("BOOT", "MCU Sync SUCCESS. Active ID: " .. get_device_id())
+        else
+            log.info("BOOT", "MCU Sync TIMEOUT. Active ID: " .. get_device_id())
         end
-        if mcu_map.TYPE and config.TYPE ~= mcu_map.TYPE then
-            config.TYPE = mcu_map.TYPE
-            modified = true
-        end
-        if mcu_map.RPT then
-            config.REPORT_INTERVAL = tonumber(mcu_map.RPT) * 60 * 1000
-            modified = true
-            sys.publish("REPORT_INTERVAL_UPDATED")
-        end
-        if modified then
-            config.save()
-        end
-        log.info("BOOT", "MCU Sync SUCCESS. Active ID: " .. get_device_id())
+        mcu_is_busy = false
     else
-        log.info("BOOT", "MCU Sync TIMEOUT. Active ID: " .. get_device_id())
+        log.info("BOOT", "MCU Sync skipped for low-power boot")
     end
-    mcu_is_busy = false
     
     boot_synced = true
     sys.publish("BOOT_SYNC_DONE") -- 通知心跳任务可以开始了
@@ -517,6 +590,11 @@ local function timer_task()
     end
 
     -- 第二阶段：正常周期循环 (开机立即执行一次 MG)
+    if config.FIRST_REPORT_DELAY_MS and config.FIRST_REPORT_DELAY_MS > 0 then
+        log.info("CYCLE", "First MG delayed " .. tostring(config.FIRST_REPORT_DELAY_MS) .. "ms")
+        sys.waitUntil("REPORT_INTERVAL_UPDATED", config.FIRST_REPORT_DELAY_MS)
+    end
+
     while true do
         local current_devid = get_device_id()
 
@@ -534,11 +612,21 @@ local function timer_task()
             log.error("CYCLE", "MCU Offline! Report EVT,MD")
             proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, get_device_type(), false, last_lat, last_lng))
             if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
+            if config.PSM_AFTER_REPORT then
+                sys.wait(2000)
+                enter_psm_sleep("mcu_offline_reported")
+                return
+            end
         end
         -- 注意：如果单片机在线，它随后会通过串口主动上报 MR 帧，
-        -- 届时 uart_task 会负责转发 MR 并执行 rrcRelease，此处只需静候。
 
         mcu_is_busy = false
+
+        if config.PSM_AFTER_REPORT then
+            local ok = sys.waitUntil("REPORT_TX_DONE", config.REPORT_TX_WAIT_MS or 20000)
+            enter_psm_sleep(ok and "report_uploaded" or "report_wait_timeout")
+            return
+        end
         
         -- 4. 周期休眠
         log.info("CYCLE", "Sleep " .. (config.REPORT_INTERVAL / 60000) .. " min")
@@ -550,14 +638,20 @@ end
 local function heartbeat_task()
     -- 心跳也要等待首次握手结果，否则发出的 ID 可能是错的
     sys.waitUntil("BOOT_SYNC_DONE")
+
+    if config.HEARTBEAT_START_DELAY_MS and config.HEARTBEAT_START_DELAY_MS > 0 then
+        log.info("HB", "First heartbeat delayed " .. tostring(config.HEARTBEAT_START_DELAY_MS) .. "ms")
+        sys.wait(config.HEARTBEAT_START_DELAY_MS)
+    end
     
     while true do
         if netc then
             local now = os.time()
             local elapsed = now - (proto.last_tx_time or 0)
-            local interval = (config.NAT_INTERVAL and config.NAT_INTERVAL > 0) and (config.NAT_INTERVAL / 1000) or 600
+            local interval = (config.NAT_INTERVAL and config.NAT_INTERVAL > 0) and (config.NAT_INTERVAL / 1000) or 300
+            local remain_sec = interval - elapsed
             
-            if elapsed >= interval then
+            if remain_sec <= 0 then
                 -- 升级为标准 AS 协议帧心跳，确保全链路报文格式统一
                 local current_devid = get_device_id()
                 proto.as_tx(netc, proto.next_id(), "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
@@ -566,11 +660,15 @@ local function heartbeat_task()
                 if mobile and mobile.rrcRelease then
                     mobile.rrcRelease(true)
                 end
+                
+                -- 发完后挂起一个完整间隔
+                sys.wait(interval * 1000)
             else
-                sys.wait((interval - elapsed) * 1000)
+                -- 睡完剩下的时间
+                sys.wait(remain_sec * 1000)
             end
         else
-            sys.wait(60000)
+            sys.wait(5000)
         end
     end
 end
@@ -595,6 +693,7 @@ local function uart_task()
                         
                         proto.as_tx(netc, mcu_mid, mcu_type, "MR", final_payload)
                         if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
+                        sys.publish("REPORT_TX_DONE")
                         
                         proto.am_tx(mcu_mid, "ACK", "MR", "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS)
                     elseif mcu_cmd == "CG" then
@@ -674,8 +773,22 @@ function app.start()
         log.info("PM", "Work Mode set to: " .. config.POWER_MODE)
     end
     uart.onReceive(function(line) sys.publish("UART_RECV", line) end)
-    sys.taskInit(network_task); sys.taskInit(heartbeat_task)
-    sys.taskInit(timer_task); sys.taskInit(uart_task); sys.taskInit(sa_command_task)
+
+    if config.NETWORK_ENABLE == false then
+        log.warn("PM", "NETWORK_ENABLE=false, cellular network tasks are disabled")
+        if mobile and mobile.flymode then
+            mobile.flymode(0, true)
+        end
+        sys.taskInit(uart_task)
+        return
+    end
+
+    sys.taskInit(network_task)
+    if config.PSM_AFTER_REPORT ~= true then
+        sys.taskInit(heartbeat_task)
+        sys.taskInit(sa_command_task)
+    end
+    sys.taskInit(timer_task); sys.taskInit(uart_task)
 end
 
 return app
