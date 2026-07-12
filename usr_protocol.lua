@@ -104,7 +104,9 @@ function proto.as_tx(sock, mid, frame_type, cmd, payload)
         socket.tx(sock, message)
         log.info("UDP_TX", message)
         proto.last_tx_time = os.time()
-        sys.taskInit(led.blink, 50)
+        if config.BLUE_LED_ENABLE then
+            sys.taskInit(led.blink, 50)
+        end
     end
 end
 
@@ -195,7 +197,9 @@ function proto.am_tx(mid, frame_type, cmd, payload)
     uart.send(message .. "\r\n")
     log.info("UART_TX", message)
     proto.trace_to_server("TX", cmd, message)
-    sys.taskInit(led.blink, 50)
+    if config.BLUE_LED_ENABLE then
+        sys.taskInit(led.blink, 50)
+    end
     
     uart_locked = false
     sys.publish("UART_UNLOCK")

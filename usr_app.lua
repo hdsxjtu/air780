@@ -117,10 +117,11 @@ local function sync_power_params(payload_map)
     end
 
     local led_enabled = parse_bool_flag(payload_map.LED or payload_map.BLINK or payload_map.BLED)
-    if led_enabled ~= nil and config.BOOT_LED_BLINK ~= led_enabled then
+    if led_enabled ~= nil and config.BLUE_LED_ENABLE ~= led_enabled then
+        config.BLUE_LED_ENABLE = led_enabled
         config.BOOT_LED_BLINK = led_enabled
         modified = true
-        log.info("APP", "BOOT_LED_BLINK updated to " .. tostring(led_enabled))
+        log.info("APP", "BLUE_LED_ENABLE updated to " .. tostring(led_enabled))
     end
 
     return modified
@@ -128,6 +129,43 @@ end
 
 
 -- [[ 内部逻辑：静默刷新 GPS 缓存 ]]
+local function is_local_4g_param(key)
+    return key == "LED" or key == "BLINK" or key == "BLED"
+end
+
+local function has_mcu_param(payload_map)
+    if not payload_map then return false end
+    for key, _ in pairs(payload_map) do
+        if key ~= "ID" and key ~= "TYPE" and key ~= "imei" and not is_local_4g_param(key) then
+            return true
+        end
+    end
+    return false
+end
+
+local function strip_local_4g_params(payload)
+    local kept = {}
+    for segment in string.gmatch(payload or "", "[^;]+") do
+        local eq_pos = string.find(segment, "=", 1, true)
+        local key = eq_pos and string.sub(segment, 1, eq_pos - 1) or segment
+        if not is_local_4g_param(key) then
+            table.insert(kept, segment)
+        end
+    end
+    return table.concat(kept, ";")
+end
+
+local function append_4g_config_fields(payload)
+    local result = payload or ""
+    if not string.find(result, "gv=", 1, true) then
+        result = result .. ";gv=4G" .. _G.VERSION
+    end
+    if not string.find(result, "LED=", 1, true) then
+        result = result .. ";LED=" .. (config.BLUE_LED_ENABLE and "1" or "0")
+    end
+    return result
+end
+
 local function update_gps_cache()
     if last_lat and last_lng then
         return -- 已经有GPS信息，不再定位
@@ -146,6 +184,7 @@ end
 -- [[ 业务中枢：处理服务器指令 (SA 帧) ]]
 local function handle_sa_command(sock, frame)
     if frame.type ~= "CMD" then return end
+    log.info("APP", "SA command received: " .. tostring(frame.cmd) .. ", mid=" .. tostring(frame.id))
     
     local payload_map = proto.parse_payload(frame.payload)
     
@@ -165,7 +204,7 @@ local function handle_sa_command(sock, frame)
         proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_ID_MISMATCH) 
         return 
     end
-    
+
     -- 2. 模组忙阻判定
     if not boot_synced or mcu_is_busy then
         log.warn("APP", "System Startup/Busy, rejecting SA command: " .. (frame.id or "N/A"))
@@ -174,13 +213,24 @@ local function handle_sa_command(sock, frame)
     end
 
     -- 3. 针对需要单片机参与的命令 (CG/CS/MS/MG/RESET/BOOT)：加忙锁
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "PS" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         mcu_is_busy = true
     end
 
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
-        local retry_count = (frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT") and 1 or 3
-        local resp_line = proto.request_mcu(frame.id, frame.cmd, frame.payload, 1500, retry_count)
+    if frame.cmd == "CS" and sync_power_params(payload_map) then
+        config.save()
+    end
+
+    if frame.cmd == "CS" and not has_mcu_param(payload_map) then
+        proto.as_tx(sock, frame.id, "RSP", "CS", "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";LED=" .. (config.BLUE_LED_ENABLE and "1" or "0") .. ";ack=" .. proto.ACK_SUCCESS)
+        mcu_is_busy = false
+        return
+    end
+
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "PS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
+        local retry_count = 1
+        local mcu_request_payload = (frame.cmd == "CS") and strip_local_4g_params(frame.payload) or frame.payload
+        local resp_line = proto.request_mcu(frame.id, frame.cmd, mcu_request_payload, 1500, retry_count)
         
         if resp_line then
             local p6 = proto.split_n(resp_line, ",", 6)
@@ -253,13 +303,13 @@ local function handle_sa_command(sock, frame)
 
             -- CG: 不在此处转发，由 uart_task 作为唯一出口并注入 gv
             -- CS: MCU 的 ack 需要返回给服务器，在此统一转发
-            if frame.cmd == "CS" then
-                local final_payload = string.gsub(mcu_payload, "(ID=[^;]+;)", "%1gv=4G" .. _G.VERSION .. ";")
-                proto.as_tx(sock, frame.id, "RSP", "CS", final_payload)
+            if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "PS" then
+                local final_payload = (frame.cmd == "PS") and mcu_payload or append_4g_config_fields(mcu_payload)
+                proto.as_tx(sock, frame.id, "RSP", frame.cmd, final_payload)
             end
         else
             last_mcu_alive = false
-            proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
+            proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";LED=" .. (config.BLUE_LED_ENABLE and "1" or "0") .. ";ack=" .. proto.ACK_OFFLINE)
         end
 
     -- 针对 MS/MG 指令的处理 (二阶段 ACK)
@@ -280,7 +330,7 @@ local function handle_sa_command(sock, frame)
             end
         else
             last_mcu_alive = false
-            proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_OFFLINE)
+            proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";LED=" .. (config.BLUE_LED_ENABLE and "1" or "0") .. ";ack=" .. proto.ACK_OFFLINE)
         end
     elseif frame.cmd == "MD" then
         -- 1. 立即回复一阶段 ACK，防止服务器超时
@@ -502,28 +552,8 @@ local function network_task()
 end
 
 -- [[ 任务 2：定时上报任务 ]]
-local function enter_psm_sleep(reason)
-    local sleep_ms = config.REPORT_INTERVAL or (60 * 60 * 1000)
-    log.info("PM", "Enter PSM+: " .. tostring(reason) .. ", wake in " .. tostring(sleep_ms) .. "ms")
-
-    if netc then
-        socket.close(netc)
-        netc = nil
-    end
-
-    if mobile and mobile.rrcRelease then
-        mobile.rrcRelease(true)
-    end
-
-    if pm.dtimerStart then
-        pm.dtimerStart(0, sleep_ms)
-    else
-        log.error("PM", "pm.dtimerStart unavailable, abort PSM+ to avoid no-wakeup sleep")
-        return
-    end
-
-    sys.wait(1000)
-    pm.power(pm.WORK_MODE, 3)
+local function disabled_deep_sleep(reason)
+    log.warn("PM", "Deep sleep is disabled; MCU controls physical power-off: " .. tostring(reason))
 end
 
 local function timer_task()
@@ -612,9 +642,9 @@ local function timer_task()
             log.error("CYCLE", "MCU Offline! Report EVT,MD")
             proto.as_tx(netc, proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, get_device_type(), false, last_lat, last_lng))
             if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
-            if config.PSM_AFTER_REPORT then
+            if false then
                 sys.wait(2000)
-                enter_psm_sleep("mcu_offline_reported")
+                disabled_deep_sleep("mcu_offline_reported")
                 return
             end
         end
@@ -622,9 +652,9 @@ local function timer_task()
 
         mcu_is_busy = false
 
-        if config.PSM_AFTER_REPORT then
+        if false then
             local ok = sys.waitUntil("REPORT_TX_DONE", config.REPORT_TX_WAIT_MS or 20000)
-            enter_psm_sleep(ok and "report_uploaded" or "report_wait_timeout")
+            disabled_deep_sleep(ok and "report_uploaded" or "report_wait_timeout")
             return
         end
         
@@ -635,6 +665,42 @@ local function timer_task()
 end
 
 -- [[ 任务 3：链路维持心跳 (极致续航) ]]
+local function network_ready_task()
+    while true do
+        sys.waitUntil("SOCKET_CONNECTED")
+        log.info("NET", "Network Ready. Notify MCU with EVT,MD")
+
+        if config.BLUE_LED_ENABLE then
+            for i = 1, 3 do
+                led.on()
+                sys.wait(100)
+                led.off()
+                sys.wait(100)
+            end
+        end
+
+        boot_synced = true
+        sys.publish("BOOT_SYNC_DONE")
+
+        local wait_count = 0
+        while mcu_is_busy and wait_count < 20 do
+            sys.wait(100)
+            wait_count = wait_count + 1
+        end
+
+        mcu_is_busy = true
+        local current_devid = get_device_id()
+        proto.am_tx(proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, get_device_type(), true, last_lat, last_lng))
+        mcu_is_busy = false
+
+        if config.BOOT_SIMULATE_MR and netc then
+            local sim_payload = "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";sim=1;MCU:25.0,0.00,25.0,0.00,25.0,0.0,25.0,1013.0,0x0000,3.70,3.70,0x00,0x00,0x08"
+            proto.as_tx(netc, proto.next_id(), "EVT", "MR", sim_payload)
+            log.info("APP", "Simulated MR sent after network ready")
+        end
+    end
+end
+
 local function heartbeat_task()
     -- 心跳也要等待首次握手结果，否则发出的 ID 可能是错的
     sys.waitUntil("BOOT_SYNC_DONE")
@@ -674,6 +740,45 @@ local function heartbeat_task()
 end
 
 -- [[ 任务 4：串口监听任务 ]]
+local function heartbeat_socket_task()
+    while true do
+        if not netc then
+            sys.waitUntil("SOCKET_CONNECTED")
+        end
+
+        while not boot_synced do
+            sys.wait(100)
+        end
+
+        if proto.last_tx_time == 0 then
+            proto.last_tx_time = os.time()
+        end
+
+        if config.HEARTBEAT_START_DELAY_MS and config.HEARTBEAT_START_DELAY_MS > 0 then
+            log.info("HB", "First heartbeat delayed " .. tostring(config.HEARTBEAT_START_DELAY_MS) .. "ms")
+            sys.wait(config.HEARTBEAT_START_DELAY_MS)
+        end
+
+        while netc do
+            local now = os.time()
+            local elapsed = now - (proto.last_tx_time or 0)
+            local interval = (config.NAT_INTERVAL and config.NAT_INTERVAL > 0) and (config.NAT_INTERVAL / 1000) or 30
+            local remain_sec = interval - elapsed
+
+            if remain_sec <= 0 then
+                local current_devid = get_device_id()
+                proto.as_tx(netc, proto.next_id(), "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
+                if mobile and mobile.rrcRelease then
+                    mobile.rrcRelease(true)
+                end
+                sys.wait(interval * 1000)
+            else
+                sys.wait(remain_sec * 1000)
+            end
+        end
+    end
+end
+
 local function uart_task()
     while true do
         local result, line = sys.waitUntil("UART_RECV", 30000)
@@ -698,7 +803,7 @@ local function uart_task()
                         proto.am_tx(mcu_mid, "ACK", "MR", "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS)
                     elseif mcu_cmd == "CG" then
                         -- 统一注入 gv，作为 CG 帧的唯一转发出口（包括 MCU 主动上报和响应服务器指令两种情况）
-                        local final_cg = string.gsub(mcu_payload, "(ID=[^;]+;)", "%1gv=4G" .. _G.VERSION .. ";")
+                        local final_cg = append_4g_config_fields(mcu_payload)
                         proto.as_tx(netc, mcu_mid, mcu_type, "CG", final_cg)
                         if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
@@ -767,8 +872,12 @@ end)
 
 function app.start()
     led.init(); uart.init()
+    if config.POWER_MODE ~= 1 then
+        log.warn("PM", "Force WORK_MODE=1 Light Sleep; MCU controls physical power-off")
+        config.POWER_MODE = 1
+    end
     if config.POWER_MODE > 0 then
-        -- 使用 pm.power 设置工作模式为 1 (Light Sleep) 或 2 (Auto-Idle)
+        -- WORK_MODE=1: Light Sleep. Deep sleep/PSM is disabled by design.
         pm.power(pm.WORK_MODE, config.POWER_MODE)
         log.info("PM", "Work Mode set to: " .. config.POWER_MODE)
     end
@@ -784,11 +893,10 @@ function app.start()
     end
 
     sys.taskInit(network_task)
-    if config.PSM_AFTER_REPORT ~= true then
-        sys.taskInit(heartbeat_task)
-        sys.taskInit(sa_command_task)
-    end
-    sys.taskInit(timer_task); sys.taskInit(uart_task)
+    sys.taskInit(network_ready_task)
+    sys.taskInit(heartbeat_socket_task)
+    sys.taskInit(sa_command_task)
+    sys.taskInit(uart_task)
 end
 
 return app
