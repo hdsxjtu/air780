@@ -23,6 +23,7 @@ local boot_synced = false    -- 握手标志：开机由于系统响应解锁
 -- [[ 新增：指令队列机制，防止丢包 ]]
 local sa_cmd_queue = {}
 local last_processed_mid = ""
+local suppress_uart_cg_mid = nil
 local last_ota_mid = nil -- 新增：用于记录下发升级指令的 MID，以便异步回调时回传结果
 local last_ota_cmd = nil -- 新增：记录升级指令类型 (FD/FU/OU)，确保回调使用正确的命令名
 local last_mcu_fw_crc = nil -- 新增：用于缓存已下载固件的 CRC，以便刷写时免除重复计算
@@ -230,6 +231,15 @@ local function handle_sa_command(sock, frame)
     if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "PS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         local retry_count = 1
         local mcu_request_payload = (frame.cmd == "CS") and strip_local_4g_params(frame.payload) or frame.payload
+        if frame.cmd == "CG" then
+            suppress_uart_cg_mid = frame.id
+            sys.taskInit(function(mid)
+                sys.wait(5000)
+                if suppress_uart_cg_mid == mid then
+                    suppress_uart_cg_mid = nil
+                end
+            end, frame.id)
+        end
         local resp_line = proto.request_mcu(frame.id, frame.cmd, mcu_request_payload, 1500, retry_count)
         
         if resp_line then
@@ -802,14 +812,23 @@ local function uart_task()
                         
                         proto.am_tx(mcu_mid, "ACK", "MR", "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_SUCCESS)
                     elseif mcu_cmd == "CG" then
+                        local cg_suppressed = false
+                        if suppress_uart_cg_mid == mcu_mid then
+                            suppress_uart_cg_mid = nil
+                            cg_suppressed = true
+                            local mcu_map = proto.parse_payload(mcu_payload)
+                            sync_ip_port(mcu_map)
+                        end
                         -- 统一注入 gv，作为 CG 帧的唯一转发出口（包括 MCU 主动上报和响应服务器指令两种情况）
-                        local final_cg = append_4g_config_fields(mcu_payload)
-                        proto.as_tx(netc, mcu_mid, mcu_type, "CG", final_cg)
-                        if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
+                        if not cg_suppressed then
+                            local final_cg = append_4g_config_fields(mcu_payload)
+                            proto.as_tx(netc, mcu_mid, mcu_type, "CG", final_cg)
+                            if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
                         -- 解析并同步 IP/Port 参数以触发连接重拨
-                        local mcu_map = proto.parse_payload(mcu_payload)
-                        sync_ip_port(mcu_map)
+                            local mcu_map = proto.parse_payload(mcu_payload)
+                            sync_ip_port(mcu_map)
+                        end
                     end
                 end
             end
