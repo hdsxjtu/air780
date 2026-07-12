@@ -10,20 +10,11 @@ proto.last_tx_time = 0
 -- 全局网络句柄与追踪状态函数，用于将串口收发追踪静默回传给服务器，方便在无串口LOG环境定位丢包问题
 local debug_sock = nil
 function proto.set_debug_socket(sock)
-    debug_sock = sock
+    debug_sock = nil
 end
 
 function proto.trace_to_server(action, cmd, data)
-    if debug_sock and cmd ~= "OD" and cmd ~= "MS" and cmd ~= "CG" and cmd ~= "MR" then
-        -- 静默异步发送调试报文，前缀为 EVT，命令为 DEBUG (过滤高频的 OD 以及频繁的 MS、CG、MR 调试帧)
-        sys.taskInit(function()
-            local clean_data = string.gsub(data or "", "[\r\n]", "")
-            if string.len(clean_data) > 100 then
-                clean_data = string.sub(clean_data, 1, 100) .. "..."
-            end
-            proto.as_tx(debug_sock, "9999", "EVT", "DEBUG", "action=" .. action .. ";cmd=" .. (cmd or "N/A") .. ";msg=" .. clean_data)
-        end)
-    end
+    return
 end
 
 -- 协议 ACK 状态码定义 (§3.7)

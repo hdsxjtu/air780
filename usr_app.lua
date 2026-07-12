@@ -668,7 +668,7 @@ end
 local function network_ready_task()
     while true do
         sys.waitUntil("SOCKET_CONNECTED")
-        log.info("NET", "Network Ready. Notify MCU with EVT,MD")
+        log.info("NET", "Network Ready. Notify MCU with EVT,NR")
 
         if config.BLUE_LED_ENABLE then
             for i = 1, 3 do
@@ -690,7 +690,7 @@ local function network_ready_task()
 
         mcu_is_busy = true
         local current_devid = get_device_id()
-        proto.am_tx(proto.next_id(), "EVT", "MD", proto.modem_payload(current_devid, get_device_type(), true, last_lat, last_lng))
+        proto.am_tx(proto.next_id(), "EVT", "NR", "ID=" .. current_devid .. ";net=1")
         mcu_is_busy = false
 
         if config.BOOT_SIMULATE_MR and netc then
