@@ -27,6 +27,16 @@ local suppress_uart_cg_mid = nil
 local last_ota_mid = nil -- 新增：用于记录下发升级指令的 MID，以便异步回调时回传结果
 local last_ota_cmd = nil -- 新增：记录升级指令类型 (FD/FU/OU)，确保回调使用正确的命令名
 local last_mcu_fw_crc = nil -- 新增：用于缓存已下载固件的 CRC，以便刷写时免除重复计算
+local pending_hb_mid = nil
+local last_hb_ack_mid = nil
+local hb_miss_count = 0
+
+local function reset_heartbeat_state()
+    pending_hb_mid = nil
+    last_hb_ack_mid = nil
+    hb_miss_count = 0
+    proto.last_tx_time = os.time()
+end
 
 -- [[ 新增：获取唯一设备 ID (优先使用 config.DEVICE_ID，最后使用 ADDR) ]]
 local function get_device_id()
@@ -430,6 +440,7 @@ end
 
 -- [[ 任务 1：核心网络任务 ]]
 local function network_task()
+    local connect_fail_count = 0
     while true do
         if socket.localIP() == "0.0.0.0" or socket.localIP() == nil then
             sys.waitUntil("IP_READY")
@@ -479,8 +490,14 @@ local function network_task()
                         else
                             local frame = proto.parse_sa_frame(data)
                             if frame then
-                                table.insert(sa_cmd_queue, frame)
-                                sys.publish("SA_QUEUE_READY")
+                                if frame.type == "ACK" and frame.cmd == "HB" then
+                                    last_hb_ack_mid = frame.id
+                                    hb_miss_count = 0
+                                    log.info("HB", "ACK received: " .. tostring(frame.id))
+                                else
+                                    table.insert(sa_cmd_queue, frame)
+                                    sys.publish("SA_QUEUE_READY")
+                                end
                             end
                         end
                     else
@@ -496,8 +513,10 @@ local function network_task()
         socket.config(netc, nil, true)
  
         if socket.connect(netc, target_ip, target_port) then
-            -- 成功连接服务器
+            connect_fail_count = 0
+            -- Server socket is ready.
             proto.set_debug_socket(netc)
+            reset_heartbeat_state()
             sys.publish("SOCKET_CONNECTED")
 
             if is_custom_ip and config.STARTUP_TS_PROBE ~= false then
@@ -554,7 +573,20 @@ local function network_task()
 
             sys.waitUntil("SOCKET_CLOSED", 86400000)
         else
+            connect_fail_count = connect_fail_count + 1
+            log.warn("NET", "Socket connect failed, count=" .. tostring(connect_fail_count))
             sys.wait(5000)
+            if connect_fail_count >= (config.SOCKET_CONNECT_FAIL_LIMIT or 3) then
+                connect_fail_count = 0
+                log.error("NET", "Socket connect failed too many times, reattaching cellular network")
+                if netc then socket.close(netc) netc = nil end
+                if mobile and mobile.flymode then
+                    mobile.flymode(0, true)
+                    sys.wait(3000)
+                    mobile.flymode(0, false)
+                    sys.wait(5000)
+                end
+            end
         end
         proto.set_debug_socket(nil)
         if netc then socket.close(netc) netc = nil end
@@ -754,14 +786,11 @@ local function heartbeat_socket_task()
     while true do
         if not netc then
             sys.waitUntil("SOCKET_CONNECTED")
+            reset_heartbeat_state()
         end
 
         while not boot_synced do
             sys.wait(100)
-        end
-
-        if proto.last_tx_time == 0 then
-            proto.last_tx_time = os.time()
         end
 
         if config.HEARTBEAT_START_DELAY_MS and config.HEARTBEAT_START_DELAY_MS > 0 then
@@ -776,8 +805,23 @@ local function heartbeat_socket_task()
             local remain_sec = interval - elapsed
 
             if remain_sec <= 0 then
+                if pending_hb_mid and last_hb_ack_mid ~= pending_hb_mid then
+                    hb_miss_count = hb_miss_count + 1
+                    log.warn("HB", "ACK missed: " .. tostring(pending_hb_mid) .. ", miss=" .. tostring(hb_miss_count))
+                    if hb_miss_count >= (config.HB_ACK_MISS_LIMIT or 3) then
+                        log.error("HB", "ACK missed too many times, rebuilding UDP socket")
+                        local old_netc = netc
+                        sys.publish("SOCKET_CLOSED")
+                        while netc == old_netc do
+                            sys.wait(200)
+                        end
+                        break
+                    end
+                end
                 local current_devid = get_device_id()
-                proto.as_tx(netc, proto.next_id(), "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
+                local hb_mid = proto.next_id()
+                pending_hb_mid = hb_mid
+                proto.as_tx(netc, hb_mid, "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
                 if mobile and mobile.rrcRelease then
                     mobile.rrcRelease(true)
                 end
