@@ -38,6 +38,7 @@ local pending_hb_mid = nil
 local last_hb_ack_mid = nil
 local hb_miss_count = 0
 local net_ready_reported = false
+local last_mcu_net_state = nil
 local network_gate_failed = false
 local usb_closed_after_netcfg = false
 
@@ -45,7 +46,6 @@ local function reset_heartbeat_state()
     pending_hb_mid = nil
     last_hb_ack_mid = nil
     hb_miss_count = 0
-    net_ready_reported = false
     network_gate_failed = false
     proto.last_tx_time = os.time()
 end
@@ -454,6 +454,12 @@ end
 
 -- [[ 任务 1：核心网络任务 ]]
 local function notify_mcu_network_result(ok, reason)
+    local next_state = ok and 1 or 0
+    if last_mcu_net_state == next_state then
+        net_ready_reported = ok
+        return
+    end
+
     local wait_count = 0
     while mcu_is_busy and wait_count < 20 do
         sys.wait(100)
@@ -464,6 +470,8 @@ local function notify_mcu_network_result(ok, reason)
     local current_devid = get_device_id()
     local payload = "ID=" .. current_devid .. ";net=" .. (ok and "1" or "0")
     proto.am_tx(proto.next_id(), "EVT", "NR", payload)
+    last_mcu_net_state = next_state
+    net_ready_reported = ok
     mcu_is_busy = false
 end
 
@@ -606,14 +614,6 @@ local function timer_task()
     sys.waitUntil("SOCKET_CONNECTED")
     log.info("NET", "Network Ready. Connection established successfully!")
     
-    if config.BOOT_LED_BLINK ~= false then
-        for i = 1, 3 do
-            led.on()
-            sys.wait(100)
-            led.off()
-            sys.wait(100)
-        end
-    end
     sys.wait(5000)
     boot_synced = false
     -- 尝试温和同步一次单片机参数 (CG)

@@ -191,10 +191,6 @@ function proto.am_tx(mid, frame_type, cmd, payload)
     local message = proto.build_frame("AM", mid, frame_type, cmd, payload)
     uart.send(message .. "\r\n")
     proto.trace_to_server("TX", cmd, message)
-    if config.BLUE_LED_ENABLE and config.LED_PACKET_BLINK and cmd ~= "OD" then
-        sys.taskInit(led.blink, 20)
-    end
-    
     uart_locked = false
     sys.publish("UART_UNLOCK")
 end

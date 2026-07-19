@@ -62,12 +62,6 @@ function led.blink(duration_ms)
 end
 
 function led.boot_marker()
-    if config.BLUE_LED_ENABLE == false then
-        led.off()
-        return
-    end
-    led.on()
-    sys.wait(1000)
     led.off()
 end
 
@@ -92,7 +86,7 @@ function led.start(initial_status)
                 led.off()
                 sys.wait(1000)
             elseif current_status == "boot" then
-                -- Boot marker only: on for 1 second, then stay off until network is ready.
+                -- Boot: keep off. Data activity and offline hints are the only visible signals.
                 led.boot_marker()
                 current_status = "waiting_network"
             elseif current_status == "waiting_network" or current_status == "hb_check" then
