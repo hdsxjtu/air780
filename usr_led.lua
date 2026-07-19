@@ -37,7 +37,7 @@ function led.activity(duration_ms)
     end
     activity_busy = true
     led.on()
-    sys.wait(duration_ms or 120)
+    sys.wait(duration_ms or 20)
     led.off()
     activity_busy = false
 end

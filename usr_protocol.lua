@@ -101,7 +101,7 @@ function proto.as_tx(sock, mid, frame_type, cmd, payload)
         socket.tx(sock, message)
         proto.last_tx_time = os.time()
         if config.BLUE_LED_ENABLE and config.LED_PACKET_BLINK then
-            sys.taskInit(led.blink, 50)
+            sys.taskInit(led.blink, 20)
         end
     end
 end
@@ -192,7 +192,7 @@ function proto.am_tx(mid, frame_type, cmd, payload)
     uart.send(message .. "\r\n")
     proto.trace_to_server("TX", cmd, message)
     if config.BLUE_LED_ENABLE and config.LED_PACKET_BLINK and cmd ~= "OD" then
-        sys.taskInit(led.blink, 50)
+        sys.taskInit(led.blink, 20)
     end
     
     uart_locked = false

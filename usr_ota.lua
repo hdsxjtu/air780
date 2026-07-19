@@ -281,7 +281,7 @@ function ota.flash(crc)
         end
 
         if block_idx % 10 == 9 then
-            sys.taskInit(led.activity, 120)
+            sys.taskInit(led.activity, 20)
         end
  
         local percent = math.floor(((block_idx + 1) / total_blocks) * 100)

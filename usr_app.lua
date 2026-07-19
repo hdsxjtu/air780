@@ -527,7 +527,7 @@ local function network_task()
                     if ok and len and len > 0 then
                         local data = rxbuff:toStr(0, len)
                         if config.BLUE_LED_ENABLE and config.LED_PACKET_BLINK then
-                            sys.taskInit(led.blink, 80)
+                            sys.taskInit(led.blink, 20)
                         end
                         local frame = proto.parse_sa_frame(data)
                         if frame then
