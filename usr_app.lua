@@ -463,11 +463,18 @@ local function notify_mcu_network_result(ok, reason)
     mcu_is_busy = true
     local current_devid = get_device_id()
     local payload = "ID=" .. current_devid .. ";net=" .. (ok and "1" or "0")
-    if reason and reason ~= "" then
-        payload = payload .. ";reason=" .. reason
-    end
     proto.am_tx(proto.next_id(), "EVT", "NR", payload)
     mcu_is_busy = false
+end
+
+local function fail_network_once(reason)
+    if network_gate_failed then
+        return
+    end
+    network_gate_failed = true
+    led.status("fail")
+    notify_mcu_network_result(false, reason)
+    sys.publish("SOCKET_CLOSED")
 end
 
 local function network_task()
@@ -532,9 +539,12 @@ local function network_task()
                         local frame = proto.parse_sa_frame(data)
                         if frame then
                             if frame.type == "ACK" and frame.cmd == "HB" then
-                                last_hb_ack_mid = frame.id
-                                hb_miss_count = 0
-                                sys.publish("HB_ACK", frame.id)
+                                local hb_map = proto.parse_payload(frame.payload)
+                                if hb_map.ack == "1" then
+                                    last_hb_ack_mid = frame.id
+                                    hb_miss_count = 0
+                                    sys.publish("HB_ACK", frame.id)
+                                end
                             else
                                 table.insert(sa_cmd_queue, frame)
                                 sys.publish("SA_QUEUE_READY")
@@ -568,10 +578,8 @@ local function network_task()
             log.warn("NET", "Socket connect failed, count=" .. tostring(connect_fail_count))
             if connect_fail_count >= (config.SOCKET_CONNECT_FAIL_LIMIT or 3) then
                 connect_fail_count = 0
-                network_gate_failed = true
-                led.status("fail")
                 log.error("NET", "Socket connect failed too many times, notify MCU net=0")
-                notify_mcu_network_result(false, "socket_connect_failed")
+                fail_network_once("socket_connect_failed")
             end
         end
         proto.set_debug_socket(nil)
@@ -735,11 +743,11 @@ local function network_ready_task()
             notify_mcu_network_result(true)
             led.status("online")
         else
-            network_gate_failed = true
-            notify_mcu_network_result(false, "no_hb_ack")
-            led.status("fail")
             log.error("NET", "HB gate failed. MCU notified net=0")
-            sys.publish("SOCKET_CLOSED")
+            fail_network_once("no_hb_ack")
+            while true do
+                sys.wait(60000)
+            end
         end
 
         if ok and config.BOOT_SIMULATE_MR and netc then
@@ -816,13 +824,11 @@ local function heartbeat_socket_task()
                     hb_miss_count = hb_miss_count + 1
                     log.warn("HB", "ACK missed: " .. tostring(pending_hb_mid) .. ", miss=" .. tostring(hb_miss_count))
                     if hb_miss_count >= (config.HB_ACK_MISS_LIMIT or 3) then
-                        log.error("HB", "ACK missed too many times, rebuilding UDP socket")
-                        local old_netc = netc
-                        sys.publish("SOCKET_CLOSED")
-                        while netc == old_netc do
-                            sys.wait(200)
+                        log.error("HB", "ACK missed too many times, notify MCU net=0")
+                        fail_network_once("hb_ack_lost")
+                        while true do
+                            sys.wait(60000)
                         end
-                        break
                     end
                 end
                 local current_devid = get_device_id()
