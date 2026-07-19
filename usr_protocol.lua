@@ -3,6 +3,12 @@ local config = require("usr_config")
 local mobile = _G.mobile
 local uart = require("usr_uart")
 local led = require("usr_led")
+local raw_log = log
+local log = {
+    info = function() end,
+    warn = raw_log.warn,
+    error = raw_log.error
+}
 
 local proto = {}
 proto.last_tx_time = 0
@@ -93,9 +99,8 @@ function proto.as_tx(sock, mid, frame_type, cmd, payload)
         end
         local message = proto.build_frame("AS", mid, frame_type, cmd, appended_payload)
         socket.tx(sock, message)
-        log.info("UDP_TX", message)
         proto.last_tx_time = os.time()
-        if config.BLUE_LED_ENABLE then
+        if config.BLUE_LED_ENABLE and config.LED_PACKET_BLINK then
             sys.taskInit(led.blink, 50)
         end
     end
@@ -148,7 +153,6 @@ function proto.request_mcu(mid, cmd, payload, timeout_ms, retries)
     local wait_ms = timeout_ms or 1500
     
     for i = 1, max_retries do
-        log.info("PROTO", "MCU Request: " .. cmd .. " (Try " .. i .. "/" .. max_retries .. ")")
         proto.am_tx(mid, "CMD", cmd, payload)
         
         local resp = proto.wait_for_uart_line(wait_ms, function(l)
@@ -186,9 +190,8 @@ function proto.am_tx(mid, frame_type, cmd, payload)
     
     local message = proto.build_frame("AM", mid, frame_type, cmd, payload)
     uart.send(message .. "\r\n")
-    log.info("UART_TX", message)
     proto.trace_to_server("TX", cmd, message)
-    if config.BLUE_LED_ENABLE then
+    if config.BLUE_LED_ENABLE and config.LED_PACKET_BLINK and cmd ~= "OD" then
         sys.taskInit(led.blink, 50)
     end
     

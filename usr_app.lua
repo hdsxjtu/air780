@@ -5,7 +5,14 @@ local lbs = require("usr_lbs")
 local uart = require("usr_uart")
 local proto = require("usr_protocol")
 local ota = require("usr_ota")
+local focus_log = require("usr_log")
 local mobile = _G.mobile
+local raw_log = log
+local log = {
+    info = function() end,
+    warn = raw_log.warn,
+    error = raw_log.error
+}
 
 -- ========================================================================
 -- 核心架构说明 (Architecture Overview):
@@ -30,11 +37,16 @@ local last_mcu_fw_crc = nil -- 新增：用于缓存已下载固件的 CRC，以
 local pending_hb_mid = nil
 local last_hb_ack_mid = nil
 local hb_miss_count = 0
+local net_ready_reported = false
+local network_gate_failed = false
+local usb_closed_after_netcfg = false
 
 local function reset_heartbeat_state()
     pending_hb_mid = nil
     last_hb_ack_mid = nil
     hb_miss_count = 0
+    net_ready_reported = false
+    network_gate_failed = false
     proto.last_tx_time = os.time()
 end
 
@@ -82,7 +94,7 @@ local function sync_mcu_identity(mcu_payload)
     end
 end
 
--- [[ 新增：解析并同步 IP/Port 配置，若有变化则重连新 IP ]]
+-- Save IP/Port config only. New server takes effect on next 4G reboot.
 local function sync_ip_port(payload_map)
     if not payload_map then return end
     if payload_map.SIP1 or payload_map.SIP2 or payload_map.SIP3 or payload_map.SIP4 or payload_map.SPT then
@@ -90,7 +102,7 @@ local function sync_ip_port(payload_map)
         local s2 = tonumber(payload_map.SIP2) or config.SIP2 or 0
         local s3 = tonumber(payload_map.SIP3) or config.SIP3 or 0
         local s4 = tonumber(payload_map.SIP4) or config.SIP4 or 0
-        local spt = tonumber(payload_map.SPT) or config.SPT or 5555
+        local spt = tonumber(payload_map.SPT) or config.SPT or 0
         
         if config.SIP1 ~= s1 or config.SIP2 ~= s2 or config.SIP3 ~= s3 or config.SIP4 ~= s4 or config.SPT ~= spt then
             config.SIP1 = s1
@@ -99,8 +111,7 @@ local function sync_ip_port(payload_map)
             config.SIP4 = s4
             config.SPT  = spt
             config.save()
-            log.info("APP", "IP/Port updated, reconnecting to new server: " .. string.format("%d.%d.%d.%d:%d", s1, s2, s3, s4, spt))
-            sys.publish("SOCKET_CLOSED")
+            log.info("APP", "IP/Port saved, effective after reboot: " .. string.format("%d.%d.%d.%d:%d", s1, s2, s3, s4, spt))
         end
     end
 end
@@ -131,6 +142,12 @@ local function sync_power_params(payload_map)
     if led_enabled ~= nil and config.BLUE_LED_ENABLE ~= led_enabled then
         config.BLUE_LED_ENABLE = led_enabled
         config.BOOT_LED_BLINK = led_enabled
+        if led_enabled then
+            led.start(net_ready_reported and "online" or "waiting_network")
+        else
+            led.status("off")
+            led.off()
+        end
         modified = true
         log.info("APP", "BLUE_LED_ENABLE updated to " .. tostring(led_enabled))
     end
@@ -309,7 +326,7 @@ local function handle_sa_command(sock, frame)
                         log.info("APP", frame.cmd .. " Success: Local TYPE updated to " .. config.TYPE)
                         modified = true
                     end
-                    -- 同步自定义 IP & Port
+                    -- Save custom IP/Port for next 4G reboot.
                     sync_ip_port(source_map)
                     if sync_power_params(source_map) then
                         modified = true
@@ -427,9 +444,6 @@ local function handle_sa_command(sock, frame)
             proto.as_tx(sock, frame.id, "RSP", "OU",
                 "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";ack=" .. proto.ACK_ERROR)
         end
-    elseif frame.cmd == "TS" then
-        sys.publish("SERVER_TS_OK")
-        log.info("APP", "TS sync response received from server!")
     end
     mcu_is_busy = false
 end
@@ -439,15 +453,33 @@ end
 -- ========================================================================
 
 -- [[ 任务 1：核心网络任务 ]]
+local function notify_mcu_network_result(ok, reason)
+    local wait_count = 0
+    while mcu_is_busy and wait_count < 20 do
+        sys.wait(100)
+        wait_count = wait_count + 1
+    end
+
+    mcu_is_busy = true
+    local current_devid = get_device_id()
+    local payload = "ID=" .. current_devid .. ";net=" .. (ok and "1" or "0")
+    if reason and reason ~= "" then
+        payload = payload .. ";reason=" .. reason
+    end
+    proto.am_tx(proto.next_id(), "EVT", "NR", payload)
+    mcu_is_busy = false
+end
+
 local function network_task()
     local connect_fail_count = 0
+    local retry_delay_ms = config.SOCKET_RETRY_MIN_MS or 10000
     while true do
         if socket.localIP() == "0.0.0.0" or socket.localIP() == nil then
+            led.status("waiting_network")
             sys.waitUntil("IP_READY")
         end
 
         if config.SERVER_CONNECT_DELAY_MS and config.SERVER_CONNECT_DELAY_MS > 0 then
-            log.info("NET", "Delay server connect: " .. tostring(config.SERVER_CONNECT_DELAY_MS) .. "ms")
             if mobile and mobile.rrcRelease then
                 mobile.rrcRelease(true)
             end
@@ -457,7 +489,7 @@ local function network_task()
         local target_ip = config.SERVER_IP
         local target_port = config.SERVER_PORT
         
-        -- 判断是否有自定义 IP 配置 (5 数字均不为 0 则判定为自定义配置)
+        -- Use the MCU/saved server when any SIP segment is non-zero; otherwise use the default server.
         local is_custom_ip = (config.SIP1 and config.SIP1 ~= 0) or 
                              (config.SIP2 and config.SIP2 ~= 0) or 
                              (config.SIP3 and config.SIP3 ~= 0) or 
@@ -465,13 +497,24 @@ local function network_task()
                              
         if is_custom_ip then
             target_ip = string.format("%d.%d.%d.%d", config.SIP1 or 0, config.SIP2 or 0, config.SIP3 or 0, config.SIP4 or 0)
-            target_port = config.SPT or 5555
+            target_port = (config.SPT and config.SPT > 0) and config.SPT or config.SERVER_PORT
         else
-            target_ip = "frp-arm.com"
-            target_port = 36297
+            target_ip = config.SERVER_IP
+            target_port = config.SERVER_PORT
         end
 
-        log.info("NET", "Connecting to server: " .. target_ip .. ":" .. tostring(target_port))
+        focus_log.network_status(config, target_ip, target_port, "IP_READY")
+        if not usb_closed_after_netcfg and pm then
+            usb_closed_after_netcfg = true
+            sys.wait(config.USB_CLOSE_AFTER_NETSTAT_MS or 0)
+            if config.USB_ENABLE == false and pm.USB then
+                pm.power(pm.USB, false)
+            end
+            if config.LOW_POWER_AFTER_NETSTAT and pm.WORK_MODE then
+                pm.power(pm.WORK_MODE, 1)
+            end
+        end
+        local connect_started_at = os.time()
         
         local rxbuff = zbuff.create(1024)
         netc = socket.create(nil, function(sc, event)
@@ -483,21 +526,18 @@ local function network_task()
                     local ok, len = socket.rx(sc, rxbuff)
                     if ok and len and len > 0 then
                         local data = rxbuff:toStr(0, len)
-                        log.info("UDP_RX", "Drained Packet: " .. data)
-                        if string.find(data, ",RSP,TS") then
-                            sys.publish("SERVER_TS_OK")
-                            log.info("NET_PROBE", "TS Response intercepted successfully!")
-                        else
-                            local frame = proto.parse_sa_frame(data)
-                            if frame then
-                                if frame.type == "ACK" and frame.cmd == "HB" then
-                                    last_hb_ack_mid = frame.id
-                                    hb_miss_count = 0
-                                    log.info("HB", "ACK received: " .. tostring(frame.id))
-                                else
-                                    table.insert(sa_cmd_queue, frame)
-                                    sys.publish("SA_QUEUE_READY")
-                                end
+                        if config.BLUE_LED_ENABLE and config.LED_PACKET_BLINK then
+                            sys.taskInit(led.blink, 80)
+                        end
+                        local frame = proto.parse_sa_frame(data)
+                        if frame then
+                            if frame.type == "ACK" and frame.cmd == "HB" then
+                                last_hb_ack_mid = frame.id
+                                hb_miss_count = 0
+                                sys.publish("HB_ACK", frame.id)
+                            else
+                                table.insert(sa_cmd_queue, frame)
+                                sys.publish("SA_QUEUE_READY")
                             end
                         end
                     else
@@ -519,77 +559,32 @@ local function network_task()
             reset_heartbeat_state()
             sys.publish("SOCKET_CONNECTED")
 
-            if is_custom_ip and config.STARTUP_TS_PROBE ~= false then
-                -- 启动连通性探测协程
-                sys.taskInit(function()
-                    local current_devid = get_device_id()
-                    local success = false
-                    log.info("NET_PROBE", "Custom IP detected, starting TS probe...")
-                    
-                    for retry = 1, 3 do
-                        sys.wait(1000) -- 给套接字连接稍微留出建立缓冲时间
-                        local ts_mid = proto.next_id()
-                        log.info("NET_PROBE", "Send TS probe frame, try: " .. retry)
-                        proto.as_tx(netc, ts_mid, "CMD", "TS", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
-                        
-                        -- 等待服务器回复 RSP,TS，超时 5000ms
-                        local ok = sys.waitUntil("SERVER_TS_OK", 5000)
-                        if ok then
-                            log.info("NET_PROBE", "TS probe success! Link locked.")
-                            success = true
-                            break
-                        else
-                            log.warn("NET_PROBE", "TS probe timeout for try: " .. retry)
-                        end
-                    end
-                    
-                    if not success then
-                        log.error("NET_PROBE", "TS probe failed 3 times! Falling back to 0.0.0.0...")
-                        -- 1. 重置 4G 本地参数为 IP=0.0.0.0, Port=5555
-                        config.SIP1 = 0
-                        config.SIP2 = 0
-                        config.SIP3 = 0
-                        config.SIP4 = 0
-                        config.SPT  = 5555
-                        config.save()
-                        
-                        -- 2. 推送串口指令给单片机，把单片机的 IP 刷为 0，端口刷为 5555
-                        proto.am_tx("0000", "CMD", "CS", "ID=" .. current_devid .. ";SIP1=0;SIP2=0;SIP3=0;SIP4=0;SPT=5555")
-                        
-                        -- 3. 强行关闭 Socket 触发 network_task 重新拨号 fallback
-                        sys.publish("SOCKET_CLOSED")
-                    end
-                end)
-            elseif config.STARTUP_TS_PROBE ~= false then
-                -- 默认服务器连接成功，发送单次 TS 帧进行测试/校对时间（不带失败回退逻辑）
-                sys.taskInit(function()
-                    sys.wait(1000)
-                    local current_devid = get_device_id()
-                    local ts_mid = proto.next_id()
-                    log.info("NET_PROBE", "Send default server TS test frame...")
-                    proto.as_tx(netc, ts_mid, "CMD", "TS", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
-                end)
-            end
-
             sys.waitUntil("SOCKET_CLOSED", 86400000)
+            if os.time() - connect_started_at >= 300 then
+                retry_delay_ms = config.SOCKET_RETRY_MIN_MS or 10000
+            end
         else
             connect_fail_count = connect_fail_count + 1
             log.warn("NET", "Socket connect failed, count=" .. tostring(connect_fail_count))
-            sys.wait(5000)
             if connect_fail_count >= (config.SOCKET_CONNECT_FAIL_LIMIT or 3) then
                 connect_fail_count = 0
-                log.error("NET", "Socket connect failed too many times, reattaching cellular network")
-                if netc then socket.close(netc) netc = nil end
-                if mobile and mobile.flymode then
-                    mobile.flymode(0, true)
-                    sys.wait(3000)
-                    mobile.flymode(0, false)
-                    sys.wait(5000)
-                end
+                network_gate_failed = true
+                led.status("fail")
+                log.error("NET", "Socket connect failed too many times, notify MCU net=0")
+                notify_mcu_network_result(false, "socket_connect_failed")
             end
         end
         proto.set_debug_socket(nil)
         if netc then socket.close(netc) netc = nil end
+        if network_gate_failed then
+            log.error("NET", "Network gate failed, stop reconnecting and wait for MCU power-off")
+            while true do
+                sys.wait(60000)
+            end
+        end
+        log.warn("NET", "Retry socket after " .. tostring(retry_delay_ms) .. "ms")
+        sys.wait(retry_delay_ms)
+        retry_delay_ms = math.min(retry_delay_ms * 2, config.SOCKET_RETRY_MAX_MS or 300000)
     end
 end
 
@@ -710,32 +705,44 @@ end
 local function network_ready_task()
     while true do
         sys.waitUntil("SOCKET_CONNECTED")
-        log.info("NET", "Network Ready. Notify MCU with EVT,NR")
+        led.status("waiting_network")
 
-        if config.BLUE_LED_ENABLE then
-            for i = 1, 3 do
-                led.on()
-                sys.wait(100)
-                led.off()
-                sys.wait(100)
+        local current_devid = get_device_id()
+        local ok = false
+        local tries = config.NET_CHECK_HB_TRIES or 3
+        local timeout_ms = config.NET_CHECK_HB_TIMEOUT_MS or 5000
+        local start_delay_ms = config.NET_CHECK_START_DELAY_MS or 0
+
+        if start_delay_ms > 0 then
+            sys.wait(start_delay_ms)
+        end
+
+        for i = 1, tries do
+            local hb_mid = proto.next_id()
+            pending_hb_mid = hb_mid
+            proto.as_tx(netc, hb_mid, "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
+            local got, ack_mid = sys.waitUntil("HB_ACK", timeout_ms)
+            if got and ack_mid == hb_mid then
+                ok = true
+                break
             end
         end
 
-        boot_synced = true
-        sys.publish("BOOT_SYNC_DONE")
-
-        local wait_count = 0
-        while mcu_is_busy and wait_count < 20 do
-            sys.wait(100)
-            wait_count = wait_count + 1
+        if ok then
+            net_ready_reported = true
+            boot_synced = true
+            sys.publish("BOOT_SYNC_DONE")
+            notify_mcu_network_result(true)
+            led.status("online")
+        else
+            network_gate_failed = true
+            notify_mcu_network_result(false, "no_hb_ack")
+            led.status("fail")
+            log.error("NET", "HB gate failed. MCU notified net=0")
+            sys.publish("SOCKET_CLOSED")
         end
 
-        mcu_is_busy = true
-        local current_devid = get_device_id()
-        proto.am_tx(proto.next_id(), "EVT", "NR", "ID=" .. current_devid .. ";net=1")
-        mcu_is_busy = false
-
-        if config.BOOT_SIMULATE_MR and netc then
+        if ok and config.BOOT_SIMULATE_MR and netc then
             local sim_payload = "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";sim=1;MCU:25.0,0.00,25.0,0.00,25.0,0.0,25.0,1013.0,0x0000,3.70,3.70,0x00,0x00,0x08"
             proto.as_tx(netc, proto.next_id(), "EVT", "MR", sim_payload)
             log.info("APP", "Simulated MR sent after network ready")
@@ -869,7 +876,7 @@ local function uart_task()
                             proto.as_tx(netc, mcu_mid, mcu_type, "CG", final_cg)
                             if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
-                        -- 解析并同步 IP/Port 参数以触发连接重拨
+                        -- Save IP/Port params for next 4G reboot.
                             local mcu_map = proto.parse_payload(mcu_payload)
                             sync_ip_port(mcu_map)
                         end
@@ -935,14 +942,20 @@ end)
 
 function app.start()
     led.init(); uart.init()
-    if config.POWER_MODE ~= 1 then
-        log.warn("PM", "Force WORK_MODE=1 Light Sleep; MCU controls physical power-off")
-        config.POWER_MODE = 1
+    if config.BLUE_LED_ENABLE then
+        led.start("boot")
+    else
+        led.off()
     end
-    if config.POWER_MODE > 0 then
+    if config.DEBUG_KEEP_AWAKE == true then
+        config.POWER_MODE = 0
+        log.warn("PM", "DEBUG_KEEP_AWAKE=true, skip Light Sleep for USB logging")
+    end
+    if config.POWER_MODE ~= 1 then
+        log.warn("PM", "WORK_MODE stays normal for debug")
+    else
         -- WORK_MODE=1: Light Sleep. Deep sleep/PSM is disabled by design.
         pm.power(pm.WORK_MODE, config.POWER_MODE)
-        log.info("PM", "Work Mode set to: " .. config.POWER_MODE)
     end
     uart.onReceive(function(line) sys.publish("UART_RECV", line) end)
 

@@ -20,8 +20,6 @@ function uart_drv.init()
     )
     if result ~= 0 then
         log.error("UART", "Setup failed: " .. result)
-    else
-        log.info("UART", "Setup success")
     end
     
     -- Setup UART receive callback

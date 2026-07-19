@@ -1,5 +1,6 @@
 local sys   = require("sys")
 local proto = require("usr_protocol")
+local led   = require("usr_led")
 local ota   = {}
 
 -- 全局升级互斥锁，防止MCU升级和4G FOTA同时发生
@@ -277,6 +278,10 @@ function ota.flash(crc)
             log.error("OTA:FU", "Block " .. block_idx .. " failed after 3 retries")
             tx_ok = false
             break
+        end
+
+        if block_idx % 10 == 9 then
+            sys.taskInit(led.activity, 120)
         end
  
         local percent = math.floor(((block_idx + 1) / total_blocks) * 100)

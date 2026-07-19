@@ -1,9 +1,9 @@
 -- Global Project Info
 -- Note: Must be defined as literals for LuatTools to recognize them
 PROJECT = "TRACKER_PRO"
-VERSION = "1.0.89"
+VERSION = "1.0.91"
 
-log.info("MAIN", "PROJECT: " .. PROJECT .. " VERSION: " .. VERSION)
+-- Keep startup logs focused; LuatTools reads PROJECT/VERSION from the literals above.
 
 -- 初始化 LED 并立即关闭，防止上电瞬间闪烁或长亮
 local led = require("usr_led")
@@ -11,6 +11,8 @@ led.init()
 led.off()
 
 local sys = require("sys")
+local focus_log = require("usr_log")
+focus_log.install()
 local config = require("usr_config")
 -- pm is global
 local app = require("usr_app")
@@ -20,32 +22,26 @@ local app = require("usr_app")
 sys.taskInit(function()
     if config.BOOT_HOLD_FLYMODE and mobile and mobile.flymode then
         mobile.flymode(0, true)
-        log.info("PM", "Boot hold flight mode enabled")
     end
 
     sys.wait(1000) 
-    log.info("MAIN", "System Started")
     
-    -- 1. 关闭 USB 以降低静态功耗
+    -- 1. Keep USB log open first. It will close after NETCFG is printed.
     if pm.USB then
-        pm.power(pm.USB, false)
+        pm.power(pm.USB, true)
     end
     
     -- 2. eDRX setup is optional. For battery boot, avoid forcing a detach/reattach cycle.
     if config.APPLY_EDRX_ON_BOOT and mobile and mobile.config then
-        log.info("NET_CONF", "Applying eDRX configuration...")
         mobile.config(mobile.CONF_EDRX, 1, 5, 3)
-        log.info("NET_CONF", "eDRX configuration applied.")
     end
     
     if config.BOOT_NETWORK_DELAY_MS and config.BOOT_NETWORK_DELAY_MS > 0 then
-        log.info("PM", "Delay network start: " .. tostring(config.BOOT_NETWORK_DELAY_MS) .. "ms")
         sys.wait(config.BOOT_NETWORK_DELAY_MS)
     end
 
     if config.NETWORK_ENABLE ~= false and config.BOOT_HOLD_FLYMODE and mobile and mobile.flymode then
         mobile.flymode(0, false)
-        log.info("PM", "Flight mode released, network can attach")
     end
     
     -- 设置模块为 Light Sleep 模式已移至 usr_app.lua
@@ -56,7 +52,7 @@ sys.taskInit(function()
         pm.power(pm.PWK_MODE, true)
     end
     
-    -- 4. 配置完成后，最后启动应用业务
+    -- 4. Start application tasks after power/network setup
     app.start()
 end)
 
