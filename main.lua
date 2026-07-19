@@ -1,7 +1,7 @@
 -- Global Project Info
 -- Note: Must be defined as literals for LuatTools to recognize them
 PROJECT = "TRACKER_PRO"
-VERSION = "1.0.95"
+VERSION = "1.0.96"
 
 -- Keep startup logs focused; LuatTools reads PROJECT/VERSION from the literals above.
 

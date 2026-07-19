@@ -47,11 +47,11 @@ function led.offline_hint()
         return
     end
     activity_busy = true
-    for i = 1, 3 do
+    for i = 1, 5 do
         led.on()
-        sys.wait(250)
+        sys.wait(20)
         led.off()
-        sys.wait(350)
+        sys.wait(180)
     end
     activity_busy = false
 end

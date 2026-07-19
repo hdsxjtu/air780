@@ -475,14 +475,10 @@ local function notify_mcu_network_result(ok, reason)
     mcu_is_busy = false
 end
 
-local function fail_network_once(reason)
-    if network_gate_failed then
-        return
-    end
+local function report_network_failed(reason)
     network_gate_failed = true
     led.status("fail")
     notify_mcu_network_result(false, reason)
-    sys.publish("SOCKET_CLOSED")
 end
 
 local function network_task()
@@ -587,17 +583,11 @@ local function network_task()
             if connect_fail_count >= (config.SOCKET_CONNECT_FAIL_LIMIT or 3) then
                 connect_fail_count = 0
                 log.error("NET", "Socket connect failed too many times, notify MCU net=0")
-                fail_network_once("socket_connect_failed")
+                report_network_failed("socket_connect_failed")
             end
         end
         proto.set_debug_socket(nil)
         if netc then socket.close(netc) netc = nil end
-        if network_gate_failed then
-            log.error("NET", "Network gate failed, stop reconnecting and wait for MCU power-off")
-            while true do
-                sys.wait(60000)
-            end
-        end
         log.warn("NET", "Retry socket after " .. tostring(retry_delay_ms) .. "ms")
         sys.wait(retry_delay_ms)
         retry_delay_ms = math.min(retry_delay_ms * 2, config.SOCKET_RETRY_MAX_MS or 300000)
@@ -744,10 +734,9 @@ local function network_ready_task()
             led.status("online")
         else
             log.error("NET", "HB gate failed. MCU notified net=0")
-            fail_network_once("no_hb_ack")
-            while true do
-                sys.wait(60000)
-            end
+            boot_synced = true
+            sys.publish("BOOT_SYNC_DONE")
+            report_network_failed("no_hb_ack")
         end
 
         if ok and config.BOOT_SIMULATE_MR and netc then
@@ -820,21 +809,24 @@ local function heartbeat_socket_task()
             local remain_sec = interval - elapsed
 
             if remain_sec <= 0 then
-                if pending_hb_mid and last_hb_ack_mid ~= pending_hb_mid then
-                    hb_miss_count = hb_miss_count + 1
-                    log.warn("HB", "ACK missed: " .. tostring(pending_hb_mid) .. ", miss=" .. tostring(hb_miss_count))
-                    if hb_miss_count >= (config.HB_ACK_MISS_LIMIT or 3) then
-                        log.error("HB", "ACK missed too many times, notify MCU net=0")
-                        fail_network_once("hb_ack_lost")
-                        while true do
-                            sys.wait(60000)
-                        end
-                    end
-                end
                 local current_devid = get_device_id()
                 local hb_mid = proto.next_id()
                 pending_hb_mid = hb_mid
                 proto.as_tx(netc, hb_mid, "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
+                local got, ack_mid = sys.waitUntil("HB_ACK", config.NET_CHECK_HB_TIMEOUT_MS or 5000)
+                if got and ack_mid == hb_mid then
+                    hb_miss_count = 0
+                    network_gate_failed = false
+                    notify_mcu_network_result(true)
+                    led.status("online")
+                else
+                    hb_miss_count = hb_miss_count + 1
+                    log.warn("HB", "ACK missed: " .. tostring(hb_mid) .. ", miss=" .. tostring(hb_miss_count))
+                    if hb_miss_count >= (config.HB_ACK_MISS_LIMIT or 3) then
+                        log.error("HB", "ACK missed too many times, notify MCU net=0")
+                        report_network_failed("hb_ack_lost")
+                    end
+                end
                 if mobile and mobile.rrcRelease then
                     mobile.rrcRelease(true)
                 end
