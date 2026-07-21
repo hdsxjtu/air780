@@ -69,13 +69,6 @@ local function id_matches_local(payload_id, current_devid)
     return payload_id == (get_device_type() .. current_devid)
 end
 
-local function send_debug_event(sock, tag, mid)
-    if not sock then return end
-    proto.as_tx(sock, proto.next_id(), "EVT", "DBG",
-        "ID=" .. get_device_id() .. ";TYPE=" .. get_device_type() ..
-        ";tag=" .. tostring(tag) .. ";mid=" .. tostring(mid or ""))
-end
-
 -- [[ 新增：解析 MCU 帧动态纠正本地 ID 认知 ]]
 local function sync_mcu_identity(mcu_payload)
     if not mcu_payload then return end
@@ -236,21 +229,17 @@ local function handle_sa_command(sock, frame)
 
     -- 2. 模组忙阻判定
     -- PS is the MR completion frame. Keep it as a transparent bridge.
-    -- If MCU does not answer, do not proxy an ACK; report only a DBG event.
+    -- If MCU does not answer, do not proxy an ACK.
     if frame.cmd == "PS" then
         mcu_is_busy = true
-        send_debug_event(sock, "PS_RX_SERVER", frame.id)
-        send_debug_event(sock, "PS_TX_MCU", frame.id)
         local resp_line = proto.request_mcu(frame.id, "PS", frame.payload, 3000, 1)
         if resp_line then
             local p6 = proto.split_n(resp_line, ",", 6)
             local mcu_payload = p6[6] or ""
             last_mcu_alive = true
             proto.as_tx(sock, frame.id, "RSP", "PS", mcu_payload)
-            send_debug_event(sock, "PS_RX_MCU", frame.id)
         else
             last_mcu_alive = false
-            send_debug_event(sock, "PS_NO_MCU_RSP", frame.id)
             log.warn("APP", "MCU did not reply PS, no proxy ACK sent: " .. tostring(frame.id))
         end
         mcu_is_busy = false
@@ -501,6 +490,12 @@ local function notify_mcu_network_result(ok, reason)
     last_mcu_net_state = next_state
     net_ready_reported = ok
     mcu_is_busy = false
+end
+
+local function reply_mcu_network_status(mid)
+    local current_devid = get_device_id()
+    local payload = "ID=" .. current_devid .. ";net=" .. (net_ready_reported and "1" or "0")
+    proto.am_tx(mid, "EVT", "NR", payload)
 end
 
 local function report_network_failed(reason)
@@ -879,7 +874,9 @@ local function uart_task()
                     -- 【动态认主】截获单片机主动吐出的 ID 前缀与数字（例如 FJ5 或 TY5）并同步认知
                     sync_mcu_identity(mcu_payload)
 
-                    if mcu_type == "RSP" or mcu_type == "ACK" then
+                    if mcu_type == "CMD" and mcu_cmd == "NR" then
+                        reply_mcu_network_status(mcu_mid)
+                    elseif mcu_type == "RSP" or mcu_type == "ACK" then
                         proto.cache_mcu_response(mcu_mid, mcu_cmd, line)
                     end
                     
