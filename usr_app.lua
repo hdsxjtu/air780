@@ -69,6 +69,13 @@ local function id_matches_local(payload_id, current_devid)
     return payload_id == (get_device_type() .. current_devid)
 end
 
+local function send_debug_event(sock, tag, mid)
+    if not sock then return end
+    proto.as_tx(sock, proto.next_id(), "EVT", "DBG",
+        "ID=" .. get_device_id() .. ";TYPE=" .. get_device_type() ..
+        ";tag=" .. tostring(tag) .. ";mid=" .. tostring(mid or ""))
+end
+
 -- [[ 新增：解析 MCU 帧动态纠正本地 ID 认知 ]]
 local function sync_mcu_identity(mcu_payload)
     if not mcu_payload then return end
@@ -219,12 +226,6 @@ local function handle_sa_command(sock, frame)
     local current_devid = get_device_id()
 
     -- 0. 重复指令判定
-    if frame.id == last_processed_mid then
-        log.warn("APP", "Duplicate MID detected, skipping: " .. frame.id)
-        return
-    end
-    last_processed_mid = frame.id
-
     -- 1. 严格 ID 校验和 IMEI 校验 (强制要求指令必须携带 IMEI 且完全匹配，防重名风险)
     local local_imei = mobile and mobile.imei and mobile.imei() or ""
     if not payload_map.ID or not id_matches_local(payload_map.ID, current_devid) or not payload_map.imei or payload_map.imei ~= local_imei then
@@ -234,6 +235,34 @@ local function handle_sa_command(sock, frame)
     end
 
     -- 2. 模组忙阻判定
+    -- PS is the MR completion frame. Keep it as a transparent bridge.
+    -- If MCU does not answer, do not proxy an ACK; report only a DBG event.
+    if frame.cmd == "PS" then
+        mcu_is_busy = true
+        send_debug_event(sock, "PS_RX_SERVER", frame.id)
+        send_debug_event(sock, "PS_TX_MCU", frame.id)
+        local resp_line = proto.request_mcu(frame.id, "PS", frame.payload, 3000, 1)
+        if resp_line then
+            local p6 = proto.split_n(resp_line, ",", 6)
+            local mcu_payload = p6[6] or ""
+            last_mcu_alive = true
+            proto.as_tx(sock, frame.id, "RSP", "PS", mcu_payload)
+            send_debug_event(sock, "PS_RX_MCU", frame.id)
+        else
+            last_mcu_alive = false
+            send_debug_event(sock, "PS_NO_MCU_RSP", frame.id)
+            log.warn("APP", "MCU did not reply PS, no proxy ACK sent: " .. tostring(frame.id))
+        end
+        mcu_is_busy = false
+        return
+    end
+
+    if frame.id == last_processed_mid then
+        log.warn("APP", "Duplicate MID detected, skipping: " .. frame.id)
+        return
+    end
+    last_processed_mid = frame.id
+
     if not boot_synced or mcu_is_busy then
         log.warn("APP", "System Startup/Busy, rejecting SA command: " .. (frame.id or "N/A"))
         proto.as_tx(sock, frame.id, "RSP", frame.cmd, "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_BUSY)
@@ -241,7 +270,7 @@ local function handle_sa_command(sock, frame)
     end
 
     -- 3. 针对需要单片机参与的命令 (CG/CS/MS/MG/RESET/BOOT)：加忙锁
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "PS" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         mcu_is_busy = true
     end
 
@@ -255,7 +284,7 @@ local function handle_sa_command(sock, frame)
         return
     end
 
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "PS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         local retry_count = 1
         local mcu_request_payload = (frame.cmd == "CS") and strip_local_4g_params(frame.payload) or frame.payload
         if frame.cmd == "CG" then
@@ -340,9 +369,8 @@ local function handle_sa_command(sock, frame)
 
             -- CG: 不在此处转发，由 uart_task 作为唯一出口并注入 gv
             -- CS: MCU 的 ack 需要返回给服务器，在此统一转发
-            if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "PS" then
-                local final_payload = (frame.cmd == "PS") and mcu_payload or append_4g_config_fields(mcu_payload)
-                proto.as_tx(sock, frame.id, "RSP", frame.cmd, final_payload)
+            if frame.cmd == "CG" or frame.cmd == "CS" then
+                proto.as_tx(sock, frame.id, "RSP", frame.cmd, append_4g_config_fields(mcu_payload))
             end
         else
             last_mcu_alive = false
@@ -850,6 +878,10 @@ local function uart_task()
                     
                     -- 【动态认主】截获单片机主动吐出的 ID 前缀与数字（例如 FJ5 或 TY5）并同步认知
                     sync_mcu_identity(mcu_payload)
+
+                    if mcu_type == "RSP" or mcu_type == "ACK" then
+                        proto.cache_mcu_response(mcu_mid, mcu_cmd, line)
+                    end
                     
                     if mcu_cmd == "MR" then
                         local current_devid = get_device_id()

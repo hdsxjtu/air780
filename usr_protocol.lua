@@ -31,6 +31,7 @@ proto.ACK_ERROR       = "3" -- 指令格式错误或参数越界 (不建议重�
 proto.ACK_OFFLINE     = "4" -- 单片机无响应/已离线 (4G返回)
 
 local uart_locked = false
+local mcu_response_cache = {}
 local next_msg_id = 3334    -- mid 计数器 (3334-6666 用于模组主动心跳)
 
 -- 辅助函数：按分隔符拆分字符串
@@ -131,19 +132,28 @@ function proto.parse_sa_frame(data)
 end
 
 -- [[ 核心逻辑：等待串口回复 ]]
+function proto.mcu_resp_topic(mid, cmd)
+    return "MCU_RESP_" .. tostring(mid) .. "_" .. tostring(cmd)
+end
+
+function proto.clear_mcu_response(mid, cmd)
+    mcu_response_cache[proto.mcu_resp_topic(mid, cmd)] = nil
+end
+
+function proto.cache_mcu_response(mid, cmd, line)
+    local topic = proto.mcu_resp_topic(mid, cmd)
+    mcu_response_cache[topic] = line
+    sys.publish(topic, line)
+end
+
+function proto.take_mcu_response(mid, cmd)
+    local topic = proto.mcu_resp_topic(mid, cmd)
+    local line = mcu_response_cache[topic]
+    mcu_response_cache[topic] = nil
+    return line
+end
+
 function proto.wait_for_uart_line(timeout_ms, matcher)
-    local end_time = mcu.ticks() + (timeout_ms or 1500)
-    while mcu.ticks() < end_time do
-        -- 缩短单次订阅时间为 200ms，以提高响应灵敏度
-        local ok, line = sys.waitUntil("UART_RECV", 200)
-        if ok and line then
-            if matcher(line) then
-                return line
-            end
-            -- 注意：不再此处 sys.publish，防止死循环！
-            -- 未处理的消息应由专门的单目异步任务 (uart_task) 统一捞取并分发到队列。
-        end
-    end
     return nil
 end
 
@@ -151,15 +161,19 @@ end
 function proto.request_mcu(mid, cmd, payload, timeout_ms, retries)
     local max_retries = retries or 3
     local wait_ms = timeout_ms or 1500
+    local resp_topic = proto.mcu_resp_topic(mid, cmd)
     
     for i = 1, max_retries do
+        proto.clear_mcu_response(mid, cmd)
         proto.am_tx(mid, "CMD", cmd, payload)
         
-        local resp = proto.wait_for_uart_line(wait_ms, function(l)
-            -- 寻找符合当前指令和 MID 的 RSP 或 ACK
-            return string.find(l, "MA,1," .. mid) and (string.find(l, ",RSP," .. cmd) or string.find(l, ",ACK," .. cmd))
-        end)
-        
+        local resp = proto.take_mcu_response(mid, cmd)
+        if not resp then
+            local ok, event_resp = sys.waitUntil(resp_topic, wait_ms)
+            if ok then
+                resp = proto.take_mcu_response(mid, cmd) or event_resp
+            end
+        end
         if resp then
             -- Matched MID/CMD means MCU replied; let upper layer handle ack value.
             if string.find(resp, "ack=") and not string.find(resp, "ack=1") then
