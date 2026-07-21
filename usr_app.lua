@@ -570,7 +570,9 @@ local function network_task()
                                 if hb_map.ack == "1" then
                                     last_hb_ack_mid = frame.id
                                     hb_miss_count = 0
-                                    sys.publish("HB_ACK", frame.id)
+                                    sys.publish("HB_ACK", frame.id, hb_map.ack)
+                                else
+                                    sys.publish("HB_ACK", frame.id, hb_map.ack or "")
                                 end
                             else
                                 table.insert(sa_cmd_queue, frame)
@@ -742,9 +744,12 @@ local function network_ready_task()
             local hb_mid = proto.next_id()
             pending_hb_mid = hb_mid
             proto.as_tx(netc, hb_mid, "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
-            local got, ack_mid = sys.waitUntil("HB_ACK", timeout_ms)
-            if got and ack_mid == hb_mid then
+            local got, ack_mid, ack_value = sys.waitUntil("HB_ACK", timeout_ms)
+            if got and ack_mid == hb_mid and ack_value == "1" then
                 ok = true
+                break
+            elseif got and ack_mid == hb_mid then
+                log.error("NET", "HB gate received bad ACK: " .. tostring(ack_value))
                 break
             end
         end
@@ -836,12 +841,15 @@ local function heartbeat_socket_task()
                 local hb_mid = proto.next_id()
                 pending_hb_mid = hb_mid
                 proto.as_tx(netc, hb_mid, "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
-                local got, ack_mid = sys.waitUntil("HB_ACK", config.NET_CHECK_HB_TIMEOUT_MS or 5000)
-                if got and ack_mid == hb_mid then
+                local got, ack_mid, ack_value = sys.waitUntil("HB_ACK", config.NET_CHECK_HB_TIMEOUT_MS or 5000)
+                if got and ack_mid == hb_mid and ack_value == "1" then
                     hb_miss_count = 0
                     network_gate_failed = false
                     notify_mcu_network_result(true)
                     led.status("online")
+                elseif got and ack_mid == hb_mid then
+                    log.error("HB", "Bad ACK received, notify MCU net=0: " .. tostring(ack_value))
+                    report_network_failed("hb_bad_ack")
                 else
                     hb_miss_count = hb_miss_count + 1
                     log.warn("HB", "ACK missed: " .. tostring(hb_mid) .. ", miss=" .. tostring(hb_miss_count))
