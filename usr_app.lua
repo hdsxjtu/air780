@@ -50,6 +50,34 @@ local function reset_heartbeat_state()
     proto.last_tx_time = os.time()
 end
 
+local function ticks_ms()
+    if mcu and mcu.ticks then
+        return mcu.ticks()
+    end
+    return os.time() * 1000
+end
+
+local function wait_for_hb_ack(mid, timeout_ms)
+    local deadline = ticks_ms() + (timeout_ms or 5000)
+    while true do
+        local remain = deadline - ticks_ms()
+        if remain <= 0 then
+            return false
+        end
+
+        local got, ack_mid, ack_value = sys.waitUntil("HB_ACK", remain)
+        if not got then
+            return false
+        end
+
+        if ack_mid == mid then
+            return true, ack_value
+        end
+
+        log.warn("HB", "Ignore stale HB ACK: " .. tostring(ack_mid) .. ", want=" .. tostring(mid))
+    end
+end
+
 -- [[ 新增：获取唯一设备 ID (优先使用 config.DEVICE_ID，最后使用 ADDR) ]]
 local function get_device_id()
     if config.DEVICE_ID then
@@ -70,6 +98,16 @@ local function id_matches_local(payload_id, current_devid)
 end
 
 -- [[ 新增：解析 MCU 帧动态纠正本地 ID 认知 ]]
+local function send_debug_event(sock, tag, mid, extra)
+    if not sock then return end
+    local payload = "ID=" .. get_device_id() .. ";TYPE=" .. get_device_type() ..
+        ";tag=" .. tostring(tag) .. ";mid=" .. tostring(mid or "")
+    if extra and extra ~= "" then
+        payload = payload .. ";" .. extra
+    end
+    proto.as_tx(sock, proto.next_id(), "EVT", "DBG", payload)
+end
+
 local function sync_mcu_identity(mcu_payload)
     if not mcu_payload then return end
     local explicit_type = string.match(mcu_payload, "TYPE=([A-Z]+)")
@@ -232,14 +270,18 @@ local function handle_sa_command(sock, frame)
     -- If MCU does not answer, do not proxy an ACK.
     if frame.cmd == "PS" then
         mcu_is_busy = true
+        send_debug_event(sock, "PS_RX_SERVER", frame.id, "len=" .. tostring(string.len(frame.payload or "")))
+        send_debug_event(sock, "PS_TX_MCU", frame.id)
         local resp_line = proto.request_mcu(frame.id, "PS", frame.payload, 3000, 1)
         if resp_line then
             local p6 = proto.split_n(resp_line, ",", 6)
             local mcu_payload = p6[6] or ""
             last_mcu_alive = true
+            send_debug_event(sock, "PS_RX_MCU", frame.id, "len=" .. tostring(string.len(mcu_payload)))
             proto.as_tx(sock, frame.id, "RSP", "PS", mcu_payload)
         else
             last_mcu_alive = false
+            send_debug_event(sock, "PS_NO_MCU_RSP", frame.id)
             log.warn("APP", "MCU did not reply PS, no proxy ACK sent: " .. tostring(frame.id))
         end
         mcu_is_busy = false
@@ -493,6 +535,11 @@ local function notify_mcu_network_result(ok, reason)
 end
 
 local function reply_mcu_network_status(mid)
+    if not boot_synced and not net_ready_reported then
+        log.warn("NET", "Ignore MCU NR query before HB gate")
+        return
+    end
+
     local current_devid = get_device_id()
     local payload = "ID=" .. current_devid .. ";net=" .. (net_ready_reported and "1" or "0")
     proto.am_tx(mid, "EVT", "NR", payload)
@@ -567,12 +614,14 @@ local function network_task()
                         if frame then
                             if frame.type == "ACK" and frame.cmd == "HB" then
                                 local hb_map = proto.parse_payload(frame.payload)
-                                if hb_map.ack == "1" then
-                                    last_hb_ack_mid = frame.id
-                                    hb_miss_count = 0
-                                    sys.publish("HB_ACK", frame.id, hb_map.ack)
-                                else
+                                if pending_hb_mid and frame.id == pending_hb_mid then
+                                    if hb_map.ack == "1" then
+                                        last_hb_ack_mid = frame.id
+                                        hb_miss_count = 0
+                                    end
                                     sys.publish("HB_ACK", frame.id, hb_map.ack or "")
+                                else
+                                    log.warn("HB", "Drop stale HB ACK: " .. tostring(frame.id) .. ", pending=" .. tostring(pending_hb_mid))
                                 end
                             else
                                 table.insert(sa_cmd_queue, frame)
@@ -607,8 +656,7 @@ local function network_task()
             log.warn("NET", "Socket connect failed, count=" .. tostring(connect_fail_count))
             if connect_fail_count >= (config.SOCKET_CONNECT_FAIL_LIMIT or 3) then
                 connect_fail_count = 0
-                log.error("NET", "Socket connect failed too many times, notify MCU net=0")
-                report_network_failed("socket_connect_failed")
+                log.error("NET", "Socket connect failed too many times; retry without MCU NR")
             end
         end
         proto.set_debug_socket(nil)
@@ -744,11 +792,12 @@ local function network_ready_task()
             local hb_mid = proto.next_id()
             pending_hb_mid = hb_mid
             proto.as_tx(netc, hb_mid, "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
-            local got, ack_mid, ack_value = sys.waitUntil("HB_ACK", timeout_ms)
-            if got and ack_mid == hb_mid and ack_value == "1" then
+            local got, ack_value = wait_for_hb_ack(hb_mid, timeout_ms)
+            pending_hb_mid = nil
+            if got and ack_value == "1" then
                 ok = true
                 break
-            elseif got and ack_mid == hb_mid then
+            elseif got then
                 log.error("NET", "HB gate received bad ACK: " .. tostring(ack_value))
                 break
             end
@@ -841,13 +890,14 @@ local function heartbeat_socket_task()
                 local hb_mid = proto.next_id()
                 pending_hb_mid = hb_mid
                 proto.as_tx(netc, hb_mid, "EVT", "HB", "ID=" .. current_devid .. ";TYPE=" .. get_device_type())
-                local got, ack_mid, ack_value = sys.waitUntil("HB_ACK", config.NET_CHECK_HB_TIMEOUT_MS or 5000)
-                if got and ack_mid == hb_mid and ack_value == "1" then
+                local got, ack_value = wait_for_hb_ack(hb_mid, config.NET_CHECK_HB_TIMEOUT_MS or 5000)
+                pending_hb_mid = nil
+                if got and ack_value == "1" then
                     hb_miss_count = 0
                     network_gate_failed = false
                     notify_mcu_network_result(true)
                     led.status("online")
-                elseif got and ack_mid == hb_mid then
+                elseif got then
                     log.error("HB", "Bad ACK received, notify MCU net=0: " .. tostring(ack_value))
                     report_network_failed("hb_bad_ack")
                 else
