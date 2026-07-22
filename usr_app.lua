@@ -268,6 +268,11 @@ local function handle_sa_command(sock, frame)
     -- 2. 模组忙阻判定
     -- PS is the MR completion frame. Keep it as a transparent bridge.
     -- If MCU does not answer, do not proxy an ACK.
+    if frame.cmd == "DG" and config.DIAG_FRAME_ENABLE == false then
+        proto.as_tx(sock, frame.id, "RSP", "DG", "ID=" .. current_devid .. ";TYPE=" .. get_device_type() .. ";gv=4G" .. _G.VERSION .. ";ack=" .. proto.ACK_ERROR)
+        return
+    end
+
     if frame.cmd == "PS" then
         mcu_is_busy = true
         send_debug_event(sock, "PS_RX_SERVER", frame.id, "len=" .. tostring(string.len(frame.payload or "")))
@@ -301,7 +306,7 @@ local function handle_sa_command(sock, frame)
     end
 
     -- 3. 针对需要单片机参与的命令 (CG/CS/MS/MG/RESET/BOOT)：加忙锁
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "DG" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         mcu_is_busy = true
     end
 
@@ -315,7 +320,7 @@ local function handle_sa_command(sock, frame)
         return
     end
 
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "DG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
         local retry_count = 1
         local mcu_request_payload = (frame.cmd == "CS") and strip_local_4g_params(frame.payload) or frame.payload
         if frame.cmd == "CG" then
@@ -402,6 +407,8 @@ local function handle_sa_command(sock, frame)
             -- CS: MCU 的 ack 需要返回给服务器，在此统一转发
             if frame.cmd == "CG" or frame.cmd == "CS" then
                 proto.as_tx(sock, frame.id, "RSP", frame.cmd, append_4g_config_fields(mcu_payload))
+            elseif frame.cmd == "DG" then
+                proto.as_tx(sock, frame.id, "RSP", "DG", mcu_payload)
             end
         else
             last_mcu_alive = false
@@ -961,10 +968,15 @@ local function uart_task()
                             proto.as_tx(netc, mcu_mid, mcu_type, "CG", final_cg)
                             if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                         
-                        -- Save IP/Port params for next 4G reboot.
+                            -- Save IP/Port params for next 4G reboot.
                             local mcu_map = proto.parse_payload(mcu_payload)
                             sync_ip_port(mcu_map)
                         end
+                    elseif mcu_cmd == "DG" then
+                        if config.DIAG_FRAME_ENABLE ~= false then
+                            proto.as_tx(netc, mcu_mid, mcu_type, "DG", mcu_payload)
+                        end
+                        if mobile and mobile.rrcRelease then mobile.rrcRelease(true) end
                     end
                 end
             end

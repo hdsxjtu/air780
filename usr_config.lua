@@ -4,76 +4,92 @@
 local config = {}
 
 -- ============================================================
--- A. Default server
--- Used only when saved SIP1~SIP4 are 0.0.0.0.
+-- A. Default server, code-only.
+-- Used when SIP1~SIP4 are all 0.0.0.0. If MCU/server writes SIP/SPT,
+-- the saved address wins on next 4G reboot.
 -- ============================================================
-config.SERVER_IP   = "frp-arm.com"
-config.SERVER_PORT = 36297
-
--- ============================================================
--- B. Fixed firmware/hardware settings
--- These are code-level settings. Do not treat them as field params.
--- ============================================================
-config.PROJECT   = "TRACKER_PRO"
-config.DEVICE_ID = nil           -- nil: build device ID from TYPE + ADDR
-
-config.LED_PIN   = 27            -- GPIO 27, active low
-config.UART_ID   = 1
-config.UART_BAUD = 9600
-config.LBS_TIMEOUT = 30000
+config.SERVER_IP   = "frp-arm.com" -- default domain
+config.SERVER_PORT = 36297         -- default UDP/FRP port
 
 -- ============================================================
--- C. Firmware behavior switches
--- Usually changed only by firmware release.
+-- B. Fixed firmware/hardware settings, code-only.
+-- Do not expose these as field parameters unless hardware changes.
 -- ============================================================
-config.POWER_MODE = 0                         -- keep normal until NETCFG is printed
-config.LOW_POWER_AFTER_NETSTAT = true         -- enter light sleep after formatted params
-config.DEBUG_KEEP_AWAKE = false               -- true keeps normal mode for USB debug
-config.NETWORK_ENABLE = true
-config.BOOT_HOLD_FLYMODE = true
-config.BOOT_NETWORK_DELAY_MS = 2000
-config.APPLY_EDRX_ON_BOOT = false
-config.USB_ENABLE = false
-config.USB_CLOSE_AFTER_NETSTAT_MS = 500
+config.PROJECT   = "TRACKER_PRO" -- Luat project name
+config.DEVICE_ID = nil           -- nil: use numeric ADDR as device ID
 
-config.BOOT_LED_BLINK = true                  -- legacy alias of BLUE_LED_ENABLE
-config.LED_PACKET_BLINK = true                -- online LED dips on packet activity
-
-config.PSM_AFTER_REPORT = false
-config.REPORT_TX_WAIT_MS = 20000
-config.BOOT_MCU_SYNC_ENABLE = false
-config.BOOT_SIMULATE_MR = false
-config.FIRST_REPORT_DELAY_MS = 0
-config.HEARTBEAT_START_DELAY_MS = 0
-config.SERVER_CONNECT_DELAY_MS = 0
-config.RESET_SAVED_SERVER_TO_DEFAULT = false  -- true clears saved SIP/SPT on boot
-
-config.NAT_INTERVAL = 30 * 1000
-config.NET_CHECK_START_DELAY_MS = 5000
-config.NET_CHECK_HB_TRIES = 3
-config.NET_CHECK_HB_TIMEOUT_MS = 5000
-config.HB_ACK_MISS_LIMIT = 3
-config.SOCKET_CONNECT_FAIL_LIMIT = 3
-config.SOCKET_RETRY_MIN_MS = 10 * 1000
-config.SOCKET_RETRY_MAX_MS = 5 * 60 * 1000
+config.LED_PIN     = 27    -- blue LED GPIO, active low
+config.UART_ID     = 1     -- UART connected to MCU
+config.UART_BAUD   = 9600  -- MCU protocol baudrate
+config.LBS_TIMEOUT = 30000 -- LBS location timeout, ms
 
 -- ============================================================
--- D. Field/server parameters
+-- C. Boot and power behavior, code-only.
+-- These control Air780E runtime behavior. Most changes require firmware
+-- download; some saved parameters below may override specific values.
+-- ============================================================
+config.POWER_MODE = 0                 -- initial mode: 0 normal, 1 light sleep
+config.LOW_POWER_AFTER_NETSTAT = true -- after NETCFG log, enter light sleep
+config.DEBUG_KEEP_AWAKE = false       -- true keeps normal mode and USB logging
+config.NETWORK_ENABLE = true          -- false disables cellular network task
+config.BOOT_HOLD_FLYMODE = true       -- hold flight mode during early boot delay
+config.BOOT_NETWORK_DELAY_MS = 2000   -- saved to json; delay before network attach
+config.APPLY_EDRX_ON_BOOT = false     -- false avoids detach/reattach on every boot
+config.USB_ENABLE = false             -- false closes USB after NETCFG is printed
+config.USB_CLOSE_AFTER_NETSTAT_MS = 500 -- wait after NETCFG before closing USB, ms
+
+-- ============================================================
+-- D. LED and debug frames, mixed.
+-- BLUE_LED_ENABLE is saved below. The others are code-only.
+-- ============================================================
+config.BOOT_LED_BLINK = true      -- legacy alias; synced from BLUE_LED_ENABLE
+config.LED_PACKET_BLINK = true    -- blink 20ms when protocol packet TX/RX occurs
+config.DIAG_FRAME_ENABLE = true   -- false hides DG crash/reset frames from server
+
+-- ============================================================
+-- E. Legacy/test behavior, code-only.
+-- Keep false unless deliberately testing old flows.
+-- ============================================================
+config.PSM_AFTER_REPORT = false       -- legacy guard; MCU now owns power-off
+config.BOOT_MCU_SYNC_ENABLE = false   -- true queries MCU CG during 4G boot
+config.BOOT_SIMULATE_MR = false       -- true sends fake boot MR, production false
+config.FIRST_REPORT_DELAY_MS = 0      -- legacy MG cycle delay
+
+-- ============================================================
+-- F. Network timing and retry policy, code-only.
+-- These affect 4G/server link only, not MCU MR retry rules.
+-- ============================================================
+config.REPORT_TX_WAIT_MS = 20000       -- wait for MCU report completion after MG
+config.HEARTBEAT_START_DELAY_MS = 0    -- delay before periodic HB starts
+config.SERVER_CONNECT_DELAY_MS = 0     -- delay after IP_READY before socket connect
+config.RESET_SAVED_SERVER_TO_DEFAULT = false -- true clears SIP/SPT at boot
+
+config.NAT_INTERVAL = 30 * 1000        -- periodic HB interval after online, ms
+config.NET_CHECK_START_DELAY_MS = 5000 -- after socket ready, wait before HB gate
+config.NET_CHECK_HB_TRIES = 3          -- boot HB gate attempts
+config.NET_CHECK_HB_TIMEOUT_MS = 5000  -- one HB ACK wait timeout, ms
+config.HB_ACK_MISS_LIMIT = 3           -- online missed HB limit
+config.SOCKET_CONNECT_FAIL_LIMIT = 3   -- consecutive socket connect failures
+config.SOCKET_RETRY_MIN_MS = 10 * 1000 -- socket retry backoff minimum
+config.SOCKET_RETRY_MAX_MS = 5 * 60 * 1000 -- socket retry backoff maximum
+
+-- ============================================================
+-- G. Field/server parameters, saved to /usr_config.json.
 -- These are saved to /usr_config.json.
 -- Server or MCU may update them.
 -- New SIP/SPT takes effect on next 4G reboot.
 -- ============================================================
-config.ADDR = 1
-config.TYPE = "TY"
+config.ADDR = 1      -- site/device numeric address
+config.TYPE = "TY"   -- device type prefix
 
-config.SIP1 = 0
-config.SIP2 = 0
-config.SIP3 = 0
-config.SIP4 = 0
-config.SPT  = 0
+config.SIP1 = 0      -- custom server IP octet 1; 0.0.0.0 means use default
+config.SIP2 = 0      -- custom server IP octet 2
+config.SIP3 = 0      -- custom server IP octet 3
+config.SIP4 = 0      -- custom server IP octet 4
+config.SPT  = 0      -- custom server port; 0 means use default
 
-config.REPORT_INTERVAL = 60 * 60 * 1000
-config.BLUE_LED_ENABLE = true
+config.REPORT_INTERVAL = 60 * 60 * 1000 -- legacy MG interval, ms
+config.BLUE_LED_ENABLE = true           -- server/CG visible LED master switch
 
 local CONFIG_FILE = "/usr_config.json"
 
