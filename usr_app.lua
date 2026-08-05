@@ -585,7 +585,11 @@ local function network_task()
                              
         if is_custom_ip then
             target_ip = string.format("%d.%d.%d.%d", config.SIP1 or 0, config.SIP2 or 0, config.SIP3 or 0, config.SIP4 or 0)
-            target_port = (config.SPT and config.SPT > 0) and config.SPT or config.SERVER_PORT
+            local spt = (config.SPT and config.SPT > 0) and config.SPT or config.SERVER_PORT
+            if spt > 0 and spt < 10000 then
+                spt = spt + 60000
+            end
+            target_port = spt
         else
             target_ip = config.SERVER_IP
             target_port = config.SERVER_PORT
