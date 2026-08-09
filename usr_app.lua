@@ -552,21 +552,35 @@ local function reply_mcu_network_status(mid)
     proto.am_tx(mid, "EVT", "NR", payload)
 end
 
+--- @brief Notify the MCU that the Air780E-to-server link is not ready.
+--- @param reason string Diagnostic reason for logs and future trace hooks.
+--- @note This emits AM,<mid>,EVT,NR,ID=<id>;net=0.  The MCU latches
+---       LTE_STATE_ERROR from this frame until a later net=1 report arrives.
 local function report_network_failed(reason)
     network_gate_failed = true
     led.status("fail")
     notify_mcu_network_result(false, reason)
 end
 
+--- @brief Maintain the cellular IP and server socket connection.
+--- @details Waits for cellular IP, connects to the configured server, receives
+---          server frames, and reports net=0 to the MCU on IP timeout, socket
+---          close, or repeated socket connection failures.
 local function network_task()
     local connect_fail_count = 0
     local retry_delay_ms = config.SOCKET_RETRY_MIN_MS or 10000
     while true do
         if socket.localIP() == "0.0.0.0" or socket.localIP() == nil then
             led.status("waiting_network")
-            sys.waitUntil("IP_READY")
+            local ip_ready = sys.waitUntil("IP_READY", config.NET_IP_READY_TIMEOUT_MS or 60000)
+            if not ip_ready then
+                log.error("NET", "IP_READY timeout; notify MCU net=0")
+                report_network_failed("ip_ready_timeout")
+                sys.wait(1000)
+            end
         end
 
+        if socket.localIP() ~= "0.0.0.0" and socket.localIP() ~= nil then
         if config.SERVER_CONNECT_DELAY_MS and config.SERVER_CONNECT_DELAY_MS > 0 then
             if mobile and mobile.rrcRelease then
                 mobile.rrcRelease(true)
@@ -645,6 +659,7 @@ local function network_task()
                 end
             elseif event == socket.EVENT_CLOSE then
                 log.error("NET", "Socket closed by remote or network!")
+                report_network_failed("socket_closed")
                 sys.publish("SOCKET_CLOSED")
             end
         end)
@@ -667,7 +682,8 @@ local function network_task()
             log.warn("NET", "Socket connect failed, count=" .. tostring(connect_fail_count))
             if connect_fail_count >= (config.SOCKET_CONNECT_FAIL_LIMIT or 3) then
                 connect_fail_count = 0
-                log.error("NET", "Socket connect failed too many times; retry without MCU NR")
+                log.error("NET", "Socket connect failed too many times; notify MCU net=0")
+                report_network_failed("socket_connect_failed")
             end
         end
         proto.set_debug_socket(nil)
@@ -675,6 +691,7 @@ local function network_task()
         log.warn("NET", "Retry socket after " .. tostring(retry_delay_ms) .. "ms")
         sys.wait(retry_delay_ms)
         retry_delay_ms = math.min(retry_delay_ms * 2, config.SOCKET_RETRY_MAX_MS or 300000)
+        end
     end
 end
 
