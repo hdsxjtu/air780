@@ -72,7 +72,7 @@ config.HB_ACK_MISS_LIMIT = 3           -- online missed HB limit
 
 --- @brief Maximum wait time for cellular IP before reporting net=0 to the MCU.
 --- @note Covers SIM/base-station/APN/IP failures before the server socket is attempted.
-config.NET_IP_READY_TIMEOUT_MS = 10 * 1000 -- wait cellular IP before notifying MCU net=0
+config.NET_IP_READY_TIMEOUT_MS = 30 * 1000 -- wait cellular IP before notifying MCU net=0
 config.SOCKET_CONNECT_FAIL_LIMIT = 3   -- consecutive socket connect failures
 config.SOCKET_RETRY_MIN_MS = 10 * 1000 -- socket retry backoff minimum
 config.SOCKET_RETRY_MAX_MS = 5 * 60 * 1000 -- socket retry backoff maximum
