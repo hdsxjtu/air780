@@ -39,6 +39,7 @@ local last_hb_ack_mid = nil
 local hb_miss_count = 0
 local net_ready_reported = false
 local last_mcu_net_state = nil
+local last_mcu_net_error = nil
 local network_gate_failed = false
 local usb_closed_after_netcfg = false
 
@@ -48,6 +49,20 @@ local function reset_heartbeat_state()
     hb_miss_count = 0
     network_gate_failed = false
     proto.last_tx_time = os.time()
+end
+
+local function network_error_code(reason)
+    if reason == "sim_not_ready" or reason == "no_sim" or reason == "no_service" or reason == "operator_rejected" then
+        return "E1"
+    end
+    if reason == "ip_ready_timeout" then
+        return "E2"
+    end
+    if reason == "socket_connect_failed" or reason == "socket_closed" or reason == "no_hb_ack" or
+        reason == "hb_bad_ack" or reason == "hb_ack_lost" then
+        return "E3"
+    end
+    return "E2"
 end
 
 local function ticks_ms()
@@ -521,7 +536,8 @@ end
 -- [[ 任务 1：核心网络任务 ]]
 local function notify_mcu_network_result(ok, reason)
     local next_state = ok and 1 or 0
-    if last_mcu_net_state == next_state then
+    local err_code = ok and nil or network_error_code(reason)
+    if last_mcu_net_state == next_state and last_mcu_net_error == err_code then
         net_ready_reported = ok
         return
     end
@@ -535,8 +551,12 @@ local function notify_mcu_network_result(ok, reason)
     mcu_is_busy = true
     local current_devid = get_device_id()
     local payload = "ID=" .. current_devid .. ";net=" .. (ok and "1" or "0")
+    if err_code then
+        payload = payload .. ";err=" .. err_code
+    end
     proto.am_tx(proto.next_id(), "EVT", "NR", payload)
     last_mcu_net_state = next_state
+    last_mcu_net_error = err_code
     net_ready_reported = ok
     mcu_is_busy = false
 end
@@ -549,6 +569,9 @@ local function reply_mcu_network_status(mid)
 
     local current_devid = get_device_id()
     local payload = "ID=" .. current_devid .. ";net=" .. (net_ready_reported and "1" or "0")
+    if not net_ready_reported and last_mcu_net_error then
+        payload = payload .. ";err=" .. last_mcu_net_error
+    end
     proto.am_tx(mid, "EVT", "NR", payload)
 end
 
