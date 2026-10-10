@@ -24,7 +24,7 @@ sys.taskInit(function()
         mobile.flymode(0, true)
     end
 
-    sys.wait(1000) 
+    sys.wait(5000) 
     
     -- 1. Keep USB log open first. It will close after NETCFG is printed.
     if pm.USB then
