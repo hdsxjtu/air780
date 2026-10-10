@@ -321,7 +321,7 @@ local function handle_sa_command(sock, frame)
     end
 
     -- 3. 针对需要单片机参与的命令 (CG/CS/MS/MG/RESET/BOOT)：加忙锁
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "DG" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "DG" or frame.cmd == "MS" or frame.cmd == "MG" or frame.cmd == "RESET" or frame.cmd == "BOOT" or frame.cmd == "HG" then
         mcu_is_busy = true
     end
 
@@ -335,7 +335,7 @@ local function handle_sa_command(sock, frame)
         return
     end
 
-    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "DG" or frame.cmd == "RESET" or frame.cmd == "BOOT" then
+    if frame.cmd == "CG" or frame.cmd == "CS" or frame.cmd == "DG" or frame.cmd == "RESET" or frame.cmd == "BOOT" or frame.cmd == "HG" then
         local retry_count = 1
         local mcu_request_payload = (frame.cmd == "CS") and strip_local_4g_params(frame.payload) or frame.payload
         if frame.cmd == "CG" then
@@ -422,8 +422,8 @@ local function handle_sa_command(sock, frame)
             -- CS: MCU 的 ack 需要返回给服务器，在此统一转发
             if frame.cmd == "CG" or frame.cmd == "CS" then
                 proto.as_tx(sock, frame.id, "RSP", frame.cmd, append_4g_config_fields(mcu_payload))
-            elseif frame.cmd == "DG" then
-                proto.as_tx(sock, frame.id, "RSP", "DG", mcu_payload)
+            elseif frame.cmd == "DG" or frame.cmd == "HG" then
+                proto.as_tx(sock, frame.id, "RSP", frame.cmd, mcu_payload)
             end
         else
             last_mcu_alive = false
