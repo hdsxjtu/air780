@@ -115,6 +115,10 @@ function proto.modem_payload(device_id, device_type, mcu_alive, lat, lng)
     end
     local mdead = mcu_alive and "0" or "1"
     local payload = "ID=" .. device_id .. ";TYPE=" .. device_type .. ";gv=4G" .. _G.VERSION .. ";mod=Air780E;rsrp=" .. tostring(rsrp) .. ";net=4G;mdead=" .. mdead
+    local iccid = sim and sim.getIccid and sim.getIccid() or ""
+    if iccid ~= "" then
+        payload = payload .. ";iccid=" .. iccid
+    end
     if lat and lng then
         payload = payload .. ";lat=" .. lat .. ";lng=" .. lng
     end
